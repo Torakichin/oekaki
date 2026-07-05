@@ -2,8 +2,8 @@
 <html lang="ja">
 <head>
 <meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1.0" />
-<title>LoiLo風 手書きアプリ (修正版)</title>
+<meta name="viewport" content="width=device-width,initial-scale=1.0,user-scalable=no" />
+<title>LoiLo風 手書きアプリ (ズーム・パン対応)</title>
 <style>
   :root{
     --toolbar-h: 92px;
@@ -329,6 +329,7 @@
     <div class="toolbar">
       <div class="tool-group">
         <button class="tool-btn active" id="tool-pencil" title="鉛筆">✏️ 鉛筆</button>
+        <button class="tool-btn" id="tool-brush" title="筆">🖌 筆</button>
         <button class="tool-btn" id="tool-marker" title="マーカー">🖍 マーカー</button>
         <button class="tool-btn" id="tool-ruler" title="ものさし">📏 定規</button>
         <button class="tool-btn" id="tool-select" title="範囲選択">⬚ 選択</button>
@@ -386,6 +387,7 @@
         <button class="tool-btn" id="insertImageBtn">🖼 画像</button>
         <button class="tool-btn" id="saveBtn">💾 保存</button>
         <button class="tool-btn" id="loadBtn">📂 読込</button>
+        <button class="tool-btn" id="resetViewBtn" title="表示リセット">🔍 リセット</button>
       </div>
     </div>
   </div>
@@ -393,7 +395,7 @@
   <div id="canvasWrap">
     <canvas id="drawCanvas"></canvas>
     <div id="selectionOverlay"></div>
-    <div class="hint">選択ツールで線をタップ、または囲むと、ハンドルで拡大縮小・回転ができます。</div>
+    <div class="hint">2本指ピンチで拡大縮小・移動ができます。細部をきれいに仕上げる際に便利です。</div>
   </div>
 
   <input class="file-input" type="file" id="imageInput" accept="image/*" />
@@ -403,7 +405,7 @@
 <script>
 (() => {
   // =========================================================
-  // DOM Elements
+  // DOM
   // =========================================================
   const canvasWrap = document.getElementById('canvasWrap');
   const canvas = document.getElementById('drawCanvas');
@@ -412,6 +414,7 @@
 
   const toolBtns = {
     pencil: document.getElementById('tool-pencil'),
+    brush: document.getElementById('tool-brush'),
     marker: document.getElementById('tool-marker'),
     ruler: document.getElementById('tool-ruler'),
     select: document.getElementById('tool-select'),
@@ -438,11 +441,12 @@
   const insertImageBtn = document.getElementById('insertImageBtn');
   const saveBtn = document.getElementById('saveBtn');
   const loadBtn = document.getElementById('loadBtn');
+  const resetViewBtn = document.getElementById('resetViewBtn');
   const imageInput = document.getElementById('imageInput');
   const loadInput = document.getElementById('loadInput');
 
   // =========================================================
-  // Configuration
+  // Config
   // =========================================================
   const STORAGE_KEY_RECENT = 'loilo_like_recent_colors_v3';
   const STORAGE_KEY_DOC = 'loilo_like_last_doc_v3';
@@ -453,11 +457,15 @@
     '#64c7ec','#b388ff','#f7c59f','#90a4ae','#e6c9a8','#b0bec5','#c5cae9','#ef9a9a','#ffcc80','#fff59d','#b9f6ca','#b39ddb'
   ];
 
+  const BRUSH_BASE_ALPHA = 0.9;
   const PENCIL_ALPHA = 1.0;
   const MARKER_ALPHA = 0.35;
 
+  const MIN_BRUSH_SIZE = 1;
+  const MAX_BRUSH_SIZE = 60;
+
   // =========================================================
-  // State Management
+  // State
   // =========================================================
   let dpr = Math.max(1, window.devicePixelRatio || 1);
   let viewW = 0, viewH = 0;
@@ -473,10 +481,21 @@
 
   let isPointerDown = false;
   let currentStroke = null;
+  let strokeLastPoint = null;
 
   let isRulerPreview = false;
   let rulerStart = null;
   let rulerCurrent = null;
+
+  // ===== ズーム・パン用ステート =====
+  let zoom = 1;
+  let panX = 0;
+  let panY = 0;
+  let activePointers = new Map();
+  let pinchStartDist = 0;
+  let pinchStartZoom = 1;
+  let pinchStartCenter = { x: 0, y: 0 };
+  let pinchStartPan = { x: 0, y: 0 };
 
   let selection = {
     ids: [],
@@ -496,9 +515,10 @@
   let clipboardObjects = null;
 
   let recentColors = loadRecentColors();
+  let pendingColorFromDrag = null; 
 
   // =========================================================
-  // Utilities & Math
+  // Utilities
   // =========================================================
   function clamp(v,min,max){ return Math.max(min, Math.min(max, v)); }
   function lerp(a,b,t){ return a + (b-a)*t; }
@@ -506,7 +526,9 @@
   function radToDeg(r){ return r * 180 / Math.PI; }
   function degToRad(d){ return d * Math.PI / 180; }
 
-  function deepClone(obj){ return JSON.parse(JSON.stringify(obj)); }
+  function deepClone(obj){
+    return JSON.parse(JSON.stringify(obj));
+  }
 
   function saveSnapshot(){
     undoStack.push(serializeDoc());
@@ -515,7 +537,12 @@
   }
 
   function serializeDoc(){
-    return JSON.stringify({ objects, currentColor, currentSize, recentColors });
+    return JSON.stringify({
+      objects,
+      currentColor,
+      currentSize,
+      recentColors
+    });
   }
 
   function restoreDoc(json){
@@ -530,6 +557,7 @@
       syncUI();
       redraw();
     }catch(e){
+      alert('読み込みに失敗しました。');
       console.error(e);
     }
   }
@@ -548,7 +576,9 @@
       if(!raw) return [];
       const arr = JSON.parse(raw);
       return Array.isArray(arr) ? arr.slice(0,18) : [];
-    }catch(e){ return []; }
+    }catch(e){
+      return [];
+    }
   }
 
   function normalizeColor(color){
@@ -557,9 +587,16 @@
     return c.fillStyle;
   }
 
+  // 表示上の座標からズーム・パンを逆算して論理（キャンバス内部）座標へ変換
   function getCanvasPoint(e){
     const rect = canvas.getBoundingClientRect();
-    return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+    const cx = e.clientX - rect.left;
+    const cy = e.clientY - rect.top;
+    return {
+      x: (cx - panX) / zoom,
+      y: (cy - panY) / zoom,
+      t: performance.now()
+    };
   }
 
   function resizeCanvas(){
@@ -576,45 +613,161 @@
   }
 
   // =========================================================
-  // Canvas Rendering Logic
+  // Drawing styles
   // =========================================================
-  function redraw(){
-    ctx.clearRect(0,0,viewW,viewH);
-    for(const obj of objects){
-      if(obj.type === 'stroke') drawStrokeObject(obj);
-      else if(obj.type === 'image') drawImageObject(obj);
-    }
-    if(isRulerPreview && rulerStart && rulerCurrent) drawRulerPreview();
-    if(currentStroke) drawStrokeObject(currentStroke);
+  function getObjectAlpha(obj){
+    if(obj.tool === 'marker') return obj.opacity ?? MARKER_ALPHA;
+    if(obj.tool === 'brush') return obj.opacity ?? BRUSH_BASE_ALPHA;
+    return obj.opacity ?? 1;
   }
 
-  function drawStrokeObject(obj){
-    if(!obj.points || !obj.points.length) return;
-    ctx.save();
+  function applyStrokeStyle(ctx, obj){
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
     ctx.strokeStyle = obj.color;
     ctx.fillStyle = obj.color;
-    ctx.globalAlpha = obj.opacity ?? 1;
-    ctx.lineWidth = obj.size;
+    ctx.globalAlpha = getObjectAlpha(obj);
 
+    if(obj.tool === 'marker'){
+      ctx.lineWidth = obj.size;
+      ctx.shadowBlur = 0;
+      ctx.filter = 'none';
+      return;
+    }
+
+    if(obj.tool === 'brush'){
+      ctx.lineWidth = obj.size;
+      ctx.shadowColor = obj.color;
+      ctx.shadowBlur = Math.max(0, obj.size * 0.22);
+      return;
+    }
+
+    ctx.lineWidth = obj.size;
+    ctx.shadowBlur = 0;
+    ctx.filter = 'none';
+  }
+
+  // =========================================================
+  // Stroke / image object model
+  // =========================================================
+  function makeStroke(tool, color, size){
+    return {
+      id: crypto.randomUUID(),
+      type: 'stroke',
+      tool,
+      color,
+      size,
+      opacity: tool === 'marker' ? MARKER_ALPHA : (tool === 'brush' ? BRUSH_BASE_ALPHA : PENCIL_ALPHA),
+      points: [], 
+      bbox: null
+    };
+  }
+
+  function finalizeStroke(stroke){
+    if(!stroke || stroke.points.length < 1) return null;
+    stroke.bbox = calcStrokeBBox(stroke);
+    return stroke;
+  }
+
+  function calcStrokeBBox(stroke){
+    const pts = stroke.points;
+    if(!pts.length) return {x:0,y:0,w:0,h:0,cx:0,cy:0};
+    let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;
+    for(const p of pts){
+      const w = (p.w ?? stroke.size) / 2 + 3;
+      minX = Math.min(minX, p.x - w);
+      minY = Math.min(minY, p.y - w);
+      maxX = Math.max(maxX, p.x + w);
+      maxY = Math.max(maxY, p.y + w);
+    }
+    return { x:minX, y:minY, w:maxX-minX, h:maxY-minY, cx:(minX+maxX)/2, cy:(minY+maxY)/2 };
+  }
+
+  function drawStrokeObject(obj){
+    if(!obj.points?.length) return;
+    ctx.save();
+    applyStrokeStyle(ctx, obj);
+
+    // 鉛筆(pencil)もマーカーと同様に二次ベジェ曲線で滑らかに描画する
+    if(obj.tool === 'marker' || obj.tool === 'pencil'){
+      ctx.beginPath();
+      const pts = obj.points;
+      if(pts.length === 1){
+        ctx.arc(pts[0].x, pts[0].y, obj.size/2, 0, Math.PI*2);
+        ctx.fill();
+      }else{
+        ctx.moveTo(pts[0].x, pts[0].y);
+        for(let i=1;i<pts.length;i++){
+          const p0 = pts[i-1];
+          const p1 = pts[i];
+          const mx = (p0.x + p1.x) / 2;
+          const my = (p0.y + p1.y) / 2;
+          ctx.quadraticCurveTo(p0.x, p0.y, mx, my);
+        }
+        const last = pts[pts.length-1];
+        ctx.lineTo(last.x, last.y);
+        ctx.stroke();
+      }
+      ctx.restore();
+      return;
+    }
+
+    if(obj.tool === 'brush'){
+      drawVariableWidthStroke(obj, true);
+      ctx.restore();
+      return;
+    }
+
+    drawVariableWidthStroke(obj, false);
+    ctx.restore();
+  }
+
+  function drawVariableWidthStroke(obj, isBrush){
     const pts = obj.points;
     if(pts.length === 1){
+      const p = pts[0];
       ctx.beginPath();
-      ctx.arc(pts[0].x, pts[0].y, obj.size / 2, 0, Math.PI * 2);
+      ctx.arc(p.x, p.y, (p.w ?? obj.size)/2, 0, Math.PI*2);
       ctx.fill();
-    } else {
-      ctx.beginPath();
-      ctx.moveTo(pts[0].x, pts[0].y);
-      for(let i = 1; i < pts.length; i++){
-        const mx = (pts[i-1].x + pts[i].x) / 2;
-        const my = (pts[i-1].y + pts[i].y) / 2;
-        ctx.quadraticCurveTo(pts[i-1].x, pts[i-1].y, mx, my);
-      }
-      ctx.lineTo(pts[pts.length-1].x, pts[pts.length-1].y);
-      ctx.stroke();
+      return;
     }
-    ctx.restore();
+
+    for(let i=1;i<pts.length;i++){
+      const p0 = pts[i-1];
+      const p1 = pts[i];
+      const w0 = p0.w ?? obj.size;
+      const w1 = p1.w ?? obj.size;
+
+      const angle = Math.atan2(p1.y-p0.y, p1.x-p0.x);
+      const dx0 = Math.sin(angle) * w0/2;
+      const dy0 = -Math.cos(angle) * w0/2;
+      const dx1 = Math.sin(angle) * w1/2;
+      const dy1 = -Math.cos(angle) * w1/2;
+
+      ctx.beginPath();
+      ctx.moveTo(p0.x + dx0, p0.y + dy0);
+      ctx.lineTo(p1.x + dx1, p1.y + dy1);
+      ctx.lineTo(p1.x - dx1, p1.y - dy1);
+      ctx.lineTo(p0.x - dx0, p0.y - dy0);
+      ctx.closePath();
+      ctx.fill();
+
+      if(isBrush){
+        ctx.save();
+        ctx.globalAlpha *= 0.16;
+        ctx.beginPath();
+        ctx.arc(p1.x, p1.y, Math.max(1, w1*0.48), 0, Math.PI*2);
+        ctx.fill();
+        ctx.restore();
+      }
+    }
+
+    const first = pts[0];
+    const last = pts[pts.length-1];
+    ctx.beginPath();
+    ctx.arc(first.x, first.y, (first.w ?? obj.size)/2, 0, Math.PI*2);
+    ctx.arc(last.x, last.y, (last.w ?? obj.size)/2, 0, Math.PI*2);
+    ctx.fill();
   }
 
   function drawImageObject(obj){
@@ -644,71 +797,47 @@
     ctx.translate(-cx, -cy);
   }
 
-  function drawRulerPreview(){
-    ctx.save();
-    ctx.strokeStyle = currentColor;
-    ctx.globalAlpha = currentTool === 'marker' ? MARKER_ALPHA : 1;
-    ctx.lineCap = 'round';
-    ctx.lineWidth = currentSize;
-    ctx.beginPath();
-    ctx.moveTo(rulerStart.x, rulerStart.y);
-    ctx.lineTo(rulerCurrent.x, rulerCurrent.y);
-    ctx.stroke();
-    ctx.restore();
-
-    const angleDeg = Math.round((radToDeg(Math.atan2(rulerCurrent.y-rulerStart.y, rulerCurrent.x-rulerStart.x)) + 360) % 360);
-    showAngleBadge(rulerCurrent.x, rulerCurrent.y, `${angleDeg}°`);
+  // =========================================================
+  // Hit / selection
+  // =========================================================
+  function objectWorldBBox(obj){
+    if(obj.type === 'stroke'){
+      return obj.bbox || calcStrokeBBox(obj);
+    }
+    if(obj.type === 'image'){
+      return transformedRectBBox(obj.x, obj.y, obj.w, obj.h, obj.transform);
+    }
+    return {x:0,y:0,w:0,h:0,cx:0,cy:0};
   }
 
-  function showAngleBadge(x,y,text){
-    ensureSelectionUI();
-    const el = selectionUI.angleEl;
-    el.textContent = text;
-    el.classList.remove('hidden');
-    el.style.left = x + 'px';
-    el.style.top = y + 'px';
-  }
+  function transformedRectBBox(x,y,w,h,transform){
+    const t = transform || {tx:0,ty:0,sx:1,sy:1,rotation:0};
+    const cx = x + w/2;
+    const cy = y + h/2;
+    const pts = [
+      {x:x,y:y},
+      {x:x+w,y:y},
+      {x:x+w,y:y+h},
+      {x:x,y:y+h}
+    ].map(p => transformPoint(p, {cx,cy,...t}));
 
-  // =========================================================
-  // Object BBox & Hit Testing
-  // =========================================================
-  function calcStrokeBBox(stroke){
-    const pts = stroke.points;
-    if(!pts || !pts.length) return {x:0,y:0,w:0,h:0,cx:0,cy:0};
-    let minX=Infinity, minY=Infinity, maxX=-Infinity, maxY=-Infinity;
+    let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;
     for(const p of pts){
       minX = Math.min(minX, p.x);
       minY = Math.min(minY, p.y);
       maxX = Math.max(maxX, p.x);
       maxY = Math.max(maxY, p.y);
     }
-    const pad = stroke.size / 2;
-    minX -= pad; minY -= pad; maxX += pad; maxY += pad;
-    return { x:minX, y:minY, w:maxX-minX, h:maxY-minY, cx:(minX+maxX)/2, cy:(minY+maxY)/2 };
-  }
-
-  function objectWorldBBox(obj){
-    if(obj.type === 'stroke') return obj.bbox || calcStrokeBBox(obj);
-    if(obj.type === 'image') return transformedRectBBox(obj.x, obj.y, obj.w, obj.h, obj.transform);
-    return {x:0,y:0,w:0,h:0,cx:0,cy:0};
-  }
-
-  function transformedRectBBox(x,y,w,h,transform){
-    const t = transform || {tx:0,ty:0,sx:1,sy:1,rotation:0};
-    const cx = x + w/2; const cy = y + h/2;
-    const pts = [{x,y},{x:x+w,y},{x:x+w,y:y+h},{x,y:y+h}].map(p => transformPoint(p, {cx,cy,...t}));
-    let minX=Infinity, minY=Infinity, maxX=-Infinity, maxY=-Infinity;
-    for(const p of pts){
-      minX = Math.min(minX,p.x); minY = Math.min(minY,p.y);
-      maxX = Math.max(maxX,p.x); maxY = Math.max(maxY,p.y);
-    }
     return {x:minX,y:minY,w:maxX-minX,h:maxY-minY,cx:(minX+maxX)/2,cy:(minY+maxY)/2};
   }
 
   function transformPoint(p, t){
-    const x = p.x - t.cx; const y = p.y - t.cy;
-    const sx = x * (t.sx ?? 1); const sy = y * (t.sy ?? 1);
-    const c = Math.cos(t.rotation || 0); const s = Math.sin(t.rotation || 0);
+    const x = p.x - t.cx;
+    const y = p.y - t.cy;
+    const sx = x * (t.sx ?? 1);
+    const sy = y * (t.sy ?? 1);
+    const c = Math.cos(t.rotation || 0);
+    const s = Math.sin(t.rotation || 0);
     return {
       x: t.cx + (sx*c - sy*s) + (t.tx || 0),
       y: t.cy + (sx*s + sy*c) + (t.ty || 0)
@@ -718,22 +847,27 @@
   function hitTestObject(pt){
     for(let i=objects.length-1; i>=0; i--){
       const obj = objects[i];
-      if(obj.type === 'stroke' && hitStroke(obj, pt)) return obj;
-      if(obj.type === 'image' && hitImage(obj, pt)) return obj;
+      if(obj.type === 'stroke'){
+        if(hitStroke(obj, pt)) return obj;
+      }else if(obj.type === 'image'){
+        if(hitImage(obj, pt)) return obj;
+      }
     }
     return null;
   }
 
   function hitStroke(stroke, pt){
     const bb = stroke.bbox || calcStrokeBBox(stroke);
-    const pad = 10;
-    if(pt.x < bb.x-pad || pt.x > bb.x+bb.w+pad || pt.y < bb.y-pad || pt.y > bb.y+bb.h+pad) return false;
+    if(pt.x < bb.x-6 || pt.x > bb.x+bb.w+6 || pt.y < bb.y-6 || pt.y > bb.y+bb.h+6) return false;
     const pts = stroke.points;
-    const threshold = stroke.size / 2 + 8;
-    for(let i=1; i<pts.length; i++){
-      if(pointToSegmentDistance(pt, pts[i-1], pts[i]) <= threshold) return true;
+    for(let i=1;i<pts.length;i++){
+      const p0 = pts[i-1], p1 = pts[i];
+      const w = Math.max(p0.w ?? stroke.size, p1.w ?? stroke.size) / 2 + 8;
+      if(pointToSegmentDistance(pt, p0, p1) <= w) return true;
     }
-    if(pts.length === 1) return dist(pt, pts[0]) <= threshold;
+    if(pts.length === 1){
+      return dist(pt, pts[0]) <= (pts[0].w ?? stroke.size)/2 + 6;
+    }
     return false;
   }
 
@@ -743,21 +877,25 @@
   }
 
   function pointToSegmentDistance(p, a, b){
-    const vx = b.x - a.x; const vy = b.y - a.y;
-    const wx = p.x - a.x; const wy = p.y - a.y;
+    const vx = b.x - a.x;
+    const vy = b.y - a.y;
+    const wx = p.x - a.x;
+    const wy = p.y - a.y;
     const c1 = vx*wx + vy*wy;
     if(c1 <= 0) return Math.hypot(p.x-a.x, p.y-a.y);
     const c2 = vx*vx + vy*vy;
     if(c2 <= c1) return Math.hypot(p.x-b.x, p.y-b.y);
     const t = c1 / c2;
-    return Math.hypot(p.x - (a.x + t*vx), p.y - (a.y + t*vy));
+    const px = a.x + t*vx;
+    const py = a.y + t*vy;
+    return Math.hypot(p.x-px, p.y-py);
   }
 
-  // =========================================================
-  // Selection & Transformation Logic
-  // =========================================================
   function selectObject(obj){
-    if(!obj) { clearSelection(); return; }
+    if(!obj){
+      clearSelection();
+      return;
+    }
     selection.ids = [obj.id];
     selection.transform = {tx:0,ty:0,sx:1,sy:1,rotation:0};
     updateSelectionBBox();
@@ -777,14 +915,22 @@
 
   function updateSelectionBBox(){
     const selected = getSelectedObjects();
-    if(!selected.length){ selection.bbox = null; return; }
-    let minX=Infinity, minY=Infinity, maxX=-Infinity, maxY=-Infinity;
+    if(!selected.length){
+      selection.bbox = null;
+      return;
+    }
+    let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;
     for(const obj of selected){
       const bb = objectWorldBBox(obj);
-      minX = Math.min(minX, bb.x); minY = Math.min(minY, bb.y);
-      maxX = Math.max(maxX, bb.x + bb.w); maxY = Math.max(maxY, bb.y + bb.h);
+      minX = Math.min(minX, bb.x);
+      minY = Math.min(minY, bb.y);
+      maxX = Math.max(maxX, bb.x + bb.w);
+      maxY = Math.max(maxY, bb.y + bb.h);
     }
-    selection.bbox = { x:minX, y:minY, w:maxX-minX, h:maxY-minY, cx:(minX+maxX)/2, cy:(minY+maxY)/2 };
+    selection.bbox = {
+      x:minX, y:minY, w:maxX-minX, h:maxY-minY,
+      cx:(minX+maxX)/2, cy:(minY+maxY)/2
+    };
   }
 
   function commitSelectionTransform(){
@@ -797,25 +943,35 @@
 
     for(const obj of selected){
       if(obj.type === 'stroke'){
-        obj.points = obj.points.map(p => {
-          return transformPoint(p, {
+        const pts = obj.points.map(p => {
+          const tp = transformPoint({x:p.x,y:p.y}, {
             cx:bbox.cx, cy:bbox.cy,
             tx:t.tx, ty:t.ty, sx:t.sx, sy:t.sy, rotation:t.rotation
           });
+          let newW = p.w ?? obj.size;
+          const scaleFactor = (Math.abs(t.sx) + Math.abs(t.sy)) / 2;
+          newW = clamp(newW * scaleFactor, 1, 300);
+          return { ...p, x:tp.x, y:tp.y, w:newW };
         });
-        const scaleFactor = (Math.abs(t.sx) + Math.abs(t.sy)) / 2;
-        obj.size = clamp(obj.size * scaleFactor, 1, 300);
+        obj.points = pts;
+        obj.size = clamp(obj.size * ((Math.abs(t.sx)+Math.abs(t.sy))/2), 1, 300);
         obj.bbox = calcStrokeBBox(obj);
-      } else if(obj.type === 'image'){
+      }else if(obj.type === 'image'){
         if(!obj.transform) obj.transform = {tx:0,ty:0,sx:1,sy:1,rotation:0};
         const ot = obj.transform;
-        const ownCenter = { x: obj.x + obj.w/2, y: obj.y + obj.h/2 };
+        const worldCenter = {x:bbox.cx, y:bbox.cy};
+        const ownCenter = {x:obj.x + obj.w/2, y:obj.y + obj.h/2};
+
         const moved = transformPoint(ownCenter, {
-          cx:bbox.cx, cy:bbox.cy,
+          cx:worldCenter.x, cy:worldCenter.y,
           tx:t.tx, ty:t.ty, sx:t.sx, sy:t.sy, rotation:t.rotation
         });
-        ot.tx += moved.x - ownCenter.x; ot.ty += moved.y - ownCenter.y;
-        ot.sx *= t.sx; ot.sy *= t.sy; ot.rotation += t.rotation;
+
+        ot.tx += moved.x - ownCenter.x;
+        ot.ty += moved.y - ownCenter.y;
+        ot.sx *= t.sx;
+        ot.sy *= t.sy;
+        ot.rotation += t.rotation;
       }
     }
 
@@ -826,7 +982,7 @@
   }
 
   // =========================================================
-  // Selection UI Creation & Management
+  // Selection UI
   // =========================================================
   function ensureSelectionUI(){
     if(selectionUI.boxEl) return;
@@ -880,20 +1036,35 @@
       </div>
     `;
 
-    panel.querySelector('#selColorRow').append(...DEFAULT_COLORS.slice(0,12).map(c => {
+    const selColorRow = panel.querySelector('#selColorRow');
+    DEFAULT_COLORS.slice(0,12).forEach(c => {
       const sw = document.createElement('button');
-      sw.className = 'swatch'; sw.style.background = c;
-      sw.addEventListener('click', () => applySelectionColor(c));
-      return sw;
-    }));
+      sw.className = 'swatch';
+      sw.style.background = c;
+      sw.title = c;
+      sw.addEventListener('click', () => {
+        applySelectionColor(c);
+      });
+      selColorRow.appendChild(sw);
+    });
 
     const selSizeSlider = panel.querySelector('#selSizeSlider');
     const selSizeValue = panel.querySelector('#selSizeValue');
-    selSizeSlider.addEventListener('input', () => { selSizeValue.textContent = selSizeSlider.value; });
-    selSizeSlider.addEventListener('change', () => applySelectionSize(Number(selSizeSlider.value)));
+    selSizeSlider.addEventListener('input', () => {
+      selSizeValue.textContent = selSizeSlider.value;
+    });
+    selSizeSlider.addEventListener('change', () => {
+      applySelectionSize(Number(selSizeSlider.value));
+    });
 
-    panel.querySelector('#flipXBtn').addEventListener('click', () => { selection.transform.sx *= -1; commitSelectionTransform(); });
-    panel.querySelector('#flipYBtn').addEventListener('click', () => { selection.transform.sy *= -1; commitSelectionTransform(); });
+    panel.querySelector('#flipXBtn').addEventListener('click', () => {
+      selection.transform.sx *= -1;
+      commitSelectionTransform();
+    });
+    panel.querySelector('#flipYBtn').addEventListener('click', () => {
+      selection.transform.sy *= -1;
+      commitSelectionTransform();
+    });
     panel.querySelector('#copyBtn').addEventListener('click', copySelection);
     panel.querySelector('#pasteBtn').addEventListener('click', pasteClipboard);
     panel.querySelector('#deleteSelBtn').addEventListener('click', deleteSelection);
@@ -901,249 +1072,255 @@
 
   function updateSelectionUI(){
     ensureSelectionUI();
-    const { boxEl, panelEl, angleEl, rotateStick, handles } = selectionUI;
+
+    const box = selectionUI.boxEl;
+    const panel = selectionUI.panelEl;
+    const angle = selectionUI.angleEl;
+    const stick = selectionUI.rotateStick;
+    const handles = selectionUI.handles;
 
     if(!selection.bbox || !selection.ids.length){
-      boxEl.classList.add('hidden'); panelEl.classList.add('hidden'); angleEl.classList.add('hidden'); rotateStick.classList.add('hidden');
+      box.classList.add('hidden');
+      panel.classList.add('hidden');
+      angle.classList.add('hidden');
+      stick.classList.add('hidden');
       Object.values(handles).forEach(h => h.classList.add('hidden'));
       return;
     }
 
+    // 選択UI枠を現在のズーム・パン状態（画面座標系）に変換して配置
     const bb = selection.bbox;
-    boxEl.classList.remove('hidden');
-    boxEl.style.left = bb.x + 'px'; boxEl.style.top = bb.y + 'px'; boxEl.style.width = bb.w + 'px'; boxEl.style.height = bb.h + 'px';
+    const sX = bb.x * zoom + panX;
+    const sY = bb.y * zoom + panY;
+    const sW = bb.w * zoom;
+    const sH = bb.h * zoom;
+    const sCX = bb.cx * zoom + panX;
+    const sCY = bb.cy * zoom + panY;
 
-    panelEl.classList.remove('hidden');
-    panelEl.style.left = clamp(bb.x, 8, viewW - panelEl.offsetWidth - 8) + 'px';
-    panelEl.style.top = Math.max(8, bb.y - 88) + 'px';
+    box.classList.remove('hidden');
+    box.style.left = sX + 'px';
+    box.style.top = sY + 'px';
+    box.style.width = sW + 'px';
+    box.style.height = sH + 'px';
+
+    panel.classList.remove('hidden');
+    const panelTop = Math.max(8, sY - 88);
+    const panelLeft = clamp(sX, 8, viewW - panel.offsetWidth - 8);
+    panel.style.left = panelLeft + 'px';
+    panel.style.top = panelTop + 'px';
 
     const selected = getSelectedObjects();
-    const avgSize = selected.length ? Math.round(selected.reduce((s,o)=>s+(o.size||8),0)/selected.length) : currentSize;
-    panelEl.querySelector('#selSizeSlider').value = clamp(avgSize,1,60);
-    panelEl.querySelector('#selSizeValue').textContent = clamp(avgSize,1,60);
+    const avgSize = selected.length
+      ? Math.round(selected.reduce((s,o)=>s+(o.size||8),0)/selected.length)
+      : currentSize;
+    const selSizeSlider = panel.querySelector('#selSizeSlider');
+    const selSizeValue = panel.querySelector('#selSizeValue');
+    selSizeSlider.value = clamp(avgSize,1,60);
+    selSizeValue.textContent = selSizeSlider.value;
 
-    const pts = { nw:{x:bb.x,y:bb.y}, ne:{x:bb.x+bb.w,y:bb.y}, sw:{x:bb.x,y:bb.y+bb.h}, se:{x:bb.x+bb.w,y:bb.y+bb.h} };
+    const pts = {
+      nw:{x:sX,y:sY},
+      ne:{x:sX+sW,y:sY},
+      sw:{x:sX,y:sY+sH},
+      se:{x:sX+sW,y:sY+sH}
+    };
     for(const k of ['nw','ne','sw','se']){
-      handles[k].classList.remove('hidden');
-      handles[k].style.left = pts[k].x + 'px'; handles[k].style.top = pts[k].y + 'px';
+      const h = handles[k];
+      h.classList.remove('hidden');
+      h.style.left = pts[k].x + 'px';
+      h.style.top = pts[k].y + 'px';
     }
 
-    const rX = bb.cx; const rY = bb.y - 34;
+    const rotateY = sY - 34;
+    const rotateX = sCX;
     handles.rotate.classList.remove('hidden');
-    handles.rotate.style.left = rX + 'px'; handles.rotate.style.top = rY + 'px';
+    handles.rotate.style.left = rotateX + 'px';
+    handles.rotate.style.top = rotateY + 'px';
 
-    rotateStick.classList.remove('hidden');
-    rotateStick.style.left = bb.cx + 'px'; rotateStick.style.top = rY + 'px';
-    rotateStick.style.height = Math.max(12, bb.y - rY) + 'px';
-    angleEl.classList.add('hidden');
+    stick.classList.remove('hidden');
+    stick.style.left = sCX + 'px';
+    stick.style.top = rotateY + 'px';
+    stick.style.height = Math.max(12, sY - rotateY) + 'px';
+
+    angle.classList.add('hidden');
   }
 
   function onSelectionHandlePointerDown(e){
-    e.stopPropagation(); e.preventDefault();
+    e.stopPropagation();
+    e.preventDefault();
+    activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
     if(!selection.bbox) return;
     const handle = e.currentTarget.dataset.handle;
     const pt = getCanvasPoint(e);
 
     if(handle === 'rotate'){
       interaction = {
-        type:'rotateSel', bbox: {...selection.bbox}, startTransform: {...selection.transform},
+        type:'rotateSel',
+        startPt: pt,
+        bbox: {...selection.bbox},
+        startTransform: {...selection.transform},
         baseAngle: Math.atan2(pt.y - selection.bbox.cy, pt.x - selection.bbox.cx)
       };
-    } else {
-      interaction = { type:'scaleSel', handle, startPt: pt, bbox: {...selection.bbox}, startTransform: {...selection.transform} };
+    }else{
+      interaction = {
+        type:'scaleSel',
+        handle,
+        startPt: pt,
+        bbox: {...selection.bbox},
+        startTransform: {...selection.transform}
+      };
     }
     canvas.setPointerCapture(e.pointerId);
   }
 
   function applySelectionColor(color){
+    const selected = getSelectedObjects();
+    if(!selected.length) return;
     saveSnapshot();
-    for(const obj of getSelectedObjects()) if(obj.type === 'stroke') obj.color = color;
-    pushRecentColor(color); redraw(); updateSelectionUI();
+    for(const obj of selected){
+      if(obj.type === 'stroke'){
+        obj.color = color;
+      }
+    }
+    pushRecentColor(color);
+    redraw();
+    updateSelectionUI();
   }
 
   function applySelectionSize(size){
+    const selected = getSelectedObjects();
+    if(!selected.length) return;
     saveSnapshot();
-    for(const obj of getSelectedObjects()) {
-      if(obj.type === 'stroke') { obj.size = size; obj.bbox = calcStrokeBBox(obj); }
+    for(const obj of selected){
+      if(obj.type === 'stroke'){
+        const factor = size / (obj.size || 1);
+        obj.size = size;
+        obj.points = obj.points.map(p => ({
+          ...p,
+          w: clamp((p.w ?? size) * factor, 1, 300)
+        }));
+        obj.bbox = calcStrokeBBox(obj);
+      }
     }
-    updateSelectionBBox(); updateSelectionUI(); redraw();
+    updateSelectionBBox();
+    updateSelectionUI();
+    redraw();
   }
 
-  function copySelection(){ if(getSelectedObjects().length) clipboardObjects = deepClone(getSelectedObjects()); }
-  function deleteSelection(){ if(!selection.ids.length) return; saveSnapshot(); objects = objects.filter(o => !selection.ids.includes(o.id)); clearSelection(); redraw(); }
+  function copySelection(){
+    const selected = getSelectedObjects();
+    if(!selected.length) return;
+    clipboardObjects = deepClone(selected);
+  }
 
   function pasteClipboard(){
-    if(!clipboardObjects || !clipboardObjects.length) return;
+    if(!clipboardObjects?.length) return;
     saveSnapshot();
     const pasted = deepClone(clipboardObjects).map(obj => {
       obj.id = crypto.randomUUID();
       if(obj.type === 'stroke'){
-        obj.points = obj.points.map(p => ({x:p.x+20, y:p.y+20}));
+        obj.points = obj.points.map(p => ({...p, x:p.x+20, y:p.y+20}));
         obj.bbox = calcStrokeBBox(obj);
-      } else if(obj.type === 'image'){
-        obj.x += 20; obj.y += 20; delete obj._imgEl;
+      }else if(obj.type === 'image'){
+        obj.x += 20;
+        obj.y += 20;
+        if(obj.transform){
+          obj.transform = {...obj.transform, tx:(obj.transform.tx||0)+0, ty:(obj.transform.ty||0)+0};
+        }
+        delete obj._imgEl;
       }
       return obj;
     });
-    objects.push(...pasted); selection.ids = pasted.map(o => o.id);
-    updateSelectionBBox(); updateSelectionUI(); redraw();
+    objects.push(...pasted);
+    selection.ids = pasted.map(o => o.id);
+    updateSelectionBBox();
+    updateSelectionUI();
+    redraw();
+  }
+
+  function deleteSelection(){
+    if(!selection.ids.length) return;
+    saveSnapshot();
+    objects = objects.filter(o => !selection.ids.includes(o.id));
+    clearSelection();
+    redraw();
   }
 
   // =========================================================
-  // Pointer Events Handlers
+  // Rendering
   // =========================================================
-  canvas.addEventListener('pointerdown', (e) => {
-    const pt = getCanvasPoint(e); isPointerDown = true;
+  function redraw(){
+    ctx.clearRect(0,0,viewW,viewH);
+    ctx.save();
+    // キャンバス表示のズーム・パンマトリクスを適用
+    ctx.translate(panX, panY);
+    ctx.scale(zoom, zoom);
 
-    if(currentTool === 'select'){
-      if(selection.bbox && pointInRect(pt, selection.bbox)){
-        interaction = { type:'moveSel', startPt: pt }; canvas.setPointerCapture(e.pointerId); return;
-      }
-      const hit = hitTestObject(pt);
-      if(hit){ selectObject(hit); interaction = { type:'moveSel', startPt: pt }; canvas.setPointerCapture(e.pointerId); }
-      else clearSelection();
-      return;
-    }
-    if(currentTool === 'eraserPixel'){ saveSnapshot(); interaction = { type:'erasePixel' }; eraseAtPoint(pt); redraw(); canvas.setPointerCapture(e.pointerId); return; }
-    if(currentTool === 'eraserObject'){ saveSnapshot(); interaction = { type:'eraseObject' }; eraseObjectAtPoint(pt); redraw(); canvas.setPointerCapture(e.pointerId); return; }
-    if(currentTool === 'ruler'){ interaction = { type:'ruler' }; rulerStart = pt; rulerCurrent = pt; isRulerPreview = true; redraw(); canvas.setPointerCapture(e.pointerId); return; }
-
-    if(['pencil','marker'].includes(currentTool)){
-      interaction = { type:'draw' };
-      currentStroke = { id: crypto.randomUUID(), type: 'stroke', tool: currentTool, color: currentColor, size: currentSize, opacity: currentTool === 'marker' ? MARKER_ALPHA : PENCIL_ALPHA, points: [pt], bbox: null };
-      redraw(); canvas.setPointerCapture(e.pointerId);
-    }
-  });
-
-  canvas.addEventListener('pointermove', (e) => {
-    const pt = getCanvasPoint(e);
-
-    if(interaction?.type === 'draw' && currentStroke){
-      const pts = currentStroke.points;
-      if(pts.length > 0) {
-        const prev = pts[pts.length - 1];
-        if(Math.hypot(pt.x - prev.x, pt.y - prev.y) > 2) { pts.push(pt); redraw(); }
-      }
-      return;
-    }
-    if(interaction?.type === 'ruler'){ rulerCurrent = pt; redraw(); return; }
-    if(interaction?.type === 'erasePixel'){ eraseAtPoint(pt); redraw(); return; }
-    if(interaction?.type === 'eraseObject'){ eraseObjectAtPoint(pt); redraw(); return; }
-
-    if(interaction?.type === 'moveSel' && selection.bbox){
-      const dx = pt.x - interaction.startPt.x; const dy = pt.y - interaction.startPt.y;
-      selection.bbox.x += dx; selection.bbox.y += dy; selection.bbox.cx += dx; selection.bbox.cy += dy;
-      selection.transform.tx += dx; selection.transform.ty += dy;
-      interaction.startPt = pt; updateSelectionUI(); return;
-    }
-
-    if(interaction?.type === 'scaleSel' && selection.bbox){
-      const bb = interaction.bbox; const h = interaction.handle;
-      let sx = 1, sy = 1;
-      const dx = pt.x - interaction.startPt.x; const dy = pt.y - interaction.startPt.y;
-      const sX = (h === 'nw' || h === 'sw') ? -1 : 1;
-      const sY = (h === 'nw' || h === 'ne') ? -1 : 1;
-
-      sx = 1 + sX * dx / Math.max(20, bb.w); sy = 1 + sY * dy / Math.max(20, bb.h);
-      sx = Math.abs(sx) < 0.05 ? 0.05 * Math.sign(sx) : sx; sy = Math.abs(sy) < 0.05 ? 0.05 * Math.sign(sy) : sy;
-
-      selection.transform.sx = interaction.startTransform.sx * sx;
-      selection.transform.sy = interaction.startTransform.sy * sy;
-
-      const corners = [{x:bb.x,y:bb.y},{x:bb.x+bb.w,y:bb.y},{x:bb.x+bb.w,y:bb.y+bb.h},{x:bb.x,y:bb.y+bb.h}].map(p => transformPoint(p, {
-        cx:bb.cx, cy:bb.cy, tx:interaction.startTransform.tx, ty:interaction.startTransform.ty, sx:selection.transform.sx, sy:selection.transform.sy, rotation:selection.transform.rotation
-      }));
-      const xs = corners.map(c=>c.x); const ys = corners.map(c=>c.y);
-      selection.bbox = { x:Math.min(...xs), y:Math.min(...ys), w:Math.max(...xs)-Math.min(...xs), h:Math.max(...ys)-Math.min(...ys), cx:(Math.min(...xs)+Math.max(...xs))/2, cy:(Math.min(...ys)+Math.max(...ys))/2 };
-      updateSelectionUI(); return;
-    }
-
-    if(interaction?.type === 'rotateSel' && selection.bbox){
-      const bb = interaction.bbox;
-      const delta = Math.atan2(pt.y - bb.cy, pt.x - bb.cx) - interaction.baseAngle;
-      const deg = Math.round(radToDeg(interaction.startTransform.rotation + delta));
-      selection.transform.rotation = degToRad(deg);
-
-      const corners = [{x:bb.x,y:bb.y},{x:bb.x+bb.w,y:bb.y},{x:bb.x+bb.w,y:bb.y+bb.h},{x:bb.x,y:bb.y+bb.h}].map(p => transformPoint(p,{
-        cx:bb.cx, cy:bb.cy, tx:interaction.startTransform.tx, ty:interaction.startTransform.ty, sx:interaction.startTransform.sx, sy:interaction.startTransform.sy, rotation:selection.transform.rotation
-      }));
-      const xs = corners.map(c=>c.x); const ys = corners.map(c=>c.y);
-      selection.bbox = { x:Math.min(...xs), y:Math.min(...ys), w:Math.max(...xs)-Math.min(...xs), h:Math.max(...ys)-Math.min(...ys), cx:(Math.min(...xs)+Math.max(...xs))/2, cy:(Math.min(...ys)+Math.max(...ys))/2 };
-      updateSelectionUI(); showAngleBadge(bb.cx, bb.y - 42, `${deg}°`); return;
-    }
-  });
-
-  canvas.addEventListener('pointerup', () => {
-    isPointerDown = false;
-    if(interaction?.type === 'draw' && currentStroke){
-      if(currentStroke.points.length >= 1){ saveSnapshot(); calcStrokeBBox(currentStroke); currentStroke.bbox = calcStrokeBBox(currentStroke); objects.push(currentStroke); }
-      currentStroke = null; redraw();
-    }
-    if(interaction?.type === 'ruler' && rulerStart && rulerCurrent){
-      saveSnapshot();
-      const stroke = { id: crypto.randomUUID(), type: 'stroke', tool: currentTool === 'marker' ? 'marker' : 'pencil', color: currentColor, size: currentSize, opacity: currentTool === 'marker' ? MARKER_ALPHA : PENCIL_ALPHA, points: [rulerStart, rulerCurrent], bbox: null };
-      stroke.bbox = calcStrokeBBox(stroke); objects.push(stroke);
-      isRulerPreview = false; rulerStart = rulerCurrent = null; selectionUI.angleEl?.classList.add('hidden'); redraw();
-    }
-    if(['moveSel', 'scaleSel', 'rotateSel'].includes(interaction?.type)){ if(selection.ids.length) commitSelectionTransform(); selectionUI.angleEl?.classList.add('hidden'); }
-    interaction = null;
-  });
-
-  function pointInRect(pt, rect){ return pt.x >= rect.x && pt.x <= rect.x + rect.w && pt.y >= rect.y && pt.y <= rect.y + rect.h; }
-
-  // =========================================================
-  // Eraser Implementations
-  // =========================================================
-  function eraseObjectAtPoint(pt){
-    const hit = hitTestObject(pt);
-    if(hit){ objects = objects.filter(o => o.id !== hit.id); if(selection.ids.includes(hit.id)) clearSelection(); }
-  }
-
-  function eraseAtPoint(pt){
-    const radius = Math.max(6, currentSize * 0.75); const newObjects = [];
     for(const obj of objects){
-      if(obj.type !== 'stroke'){ newObjects.push(obj); continue; }
-      const bb = obj.bbox || calcStrokeBBox(obj);
-      if(pt.x < bb.x-radius || pt.x > bb.x+bb.w+radius || pt.y < bb.y-radius || pt.y > bb.y+bb.h+radius){ newObjects.push(obj); continue; }
-
-      const segments = []; let currentSeg = [];
-      for(const p of obj.points){
-        if(Math.hypot(p.x - pt.x, p.y - pt.y) <= radius + obj.size/2){
-          if(currentSeg.length >= 1) segments.push(currentSeg);
-          currentSeg = [];
-        } else { currentSeg.push(p); }
-      }
-      if(currentSeg.length >= 1) segments.push(currentSeg);
-
-      if(!segments.length) continue;
-      if(segments.length === 1 && segments[0].length === obj.points.length){ newObjects.push(obj); }
-      else {
-        for(const seg of segments){
-          const cloned = { ...deepClone(obj), id: crypto.randomUUID(), points: seg, bbox: null };
-          cloned.bbox = calcStrokeBBox(cloned); newObjects.push(cloned);
-        }
+      if(obj.type === 'stroke'){
+        drawStrokeObject(obj);
+      }else if(obj.type === 'image'){
+        drawImageObject(obj);
       }
     }
-    objects = newObjects;
-    if(selection.ids.length){
-      const alive = new Set(objects.map(o=>o.id)); selection.ids = selection.ids.filter(id => alive.has(id));
-      if(selection.ids.length){ updateSelectionBBox(); updateSelectionUI(); } else clearSelection();
+
+    if(isRulerPreview && rulerStart && rulerCurrent){
+      drawRulerPreview();
     }
+
+    if(currentStroke){
+      drawStrokeObject(currentStroke);
+    }
+    
+    ctx.restore();
+  }
+
+  function drawRulerPreview(){
+    const p0 = rulerStart;
+    const p1 = rulerCurrent;
+    ctx.save();
+    ctx.strokeStyle = currentColor;
+    ctx.globalAlpha = currentTool === 'marker' ? MARKER_ALPHA : 1;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.lineWidth = currentSize;
+    ctx.beginPath();
+    ctx.moveTo(p0.x,p0.y);
+    ctx.lineTo(p1.x,p1.y);
+    ctx.stroke();
+    ctx.restore();
+
+    const angleDeg = Math.round((radToDeg(Math.atan2(p1.y-p0.y, p1.x-p0.x)) + 360) % 360);
+    // バッジの表示位置は画面座標系へ変換
+    showAngleBadge(p1.x * zoom + panX, p1.y * zoom + panY, `${angleDeg}°`);
+  }
+
+  function showAngleBadge(x,y,text){
+    ensureSelectionUI();
+    const el = selectionUI.angleEl;
+    el.textContent = text;
+    el.classList.remove('hidden');
+    el.style.left = x + 'px';
+    el.style.top = y + 'px';
   }
 
   // =========================================================
-  // Toolbar & Files Integration
+  // Palette
   // =========================================================
-  function setTool(tool){ currentTool = tool; Object.entries(toolBtns).forEach(([k,btn]) => btn.classList.toggle('active', k===tool)); if(tool !== 'select') clearSelection(); redraw(); }
-  function setEraser(mode){ eraserMode = mode; Object.entries(eraserBtns).forEach(([k,btn]) => btn.classList.toggle('active', k===mode)); if(mode === 'clear'){ if(confirm('全消ししますか？')){ saveSnapshot(); objects = []; clearSelection(); redraw(); } else { eraserMode = 'pixel'; syncUI(); } return; } currentTool = mode === 'pixel' ? 'eraserPixel' : 'eraserObject'; Object.values(toolBtns).forEach(btn => btn.classList.remove('active')); clearSelection(); }
-  function syncUI(){ sizeSlider.value = currentSize; sizeValue.textContent = currentSize; renderPalette(); Object.entries(toolBtns).forEach(([k,btn]) => btn.classList.toggle('active', currentTool===k)); Object.entries(eraserBtns).forEach(([k,btn]) => btn.classList.toggle('active', eraserMode===k)); }
-
   function renderPalette(){
     paletteGrid.innerHTML = '';
     DEFAULT_COLORS.forEach(c => {
-      const sw = document.createElement('button'); sw.className = 'swatch'; sw.style.background = c;
-      if(normalizeColor(c).toLowerCase() === normalizeColor(currentColor).toLowerCase()) sw.classList.add('active');
-      sw.addEventListener('click', () => { currentColor = c; pushRecentColor(c); renderPalette(); });
+      const sw = document.createElement('button');
+      sw.className = 'swatch';
+      sw.style.background = c;
+      if(normalizeColor(c).toLowerCase() === normalizeColor(currentColor).toLowerCase()){
+        sw.classList.add('active');
+      }
+      sw.addEventListener('click', () => {
+        currentColor = c;
+        pushRecentColor(c);
+        renderPalette();
+      });
       paletteGrid.appendChild(sw);
     });
     renderRecentColors();
@@ -1152,61 +1329,723 @@
   function renderRecentColors(){
     recentColorsEl.innerHTML = '';
     recentColors.forEach(c => {
-      const sw = document.createElement('button'); sw.className = 'swatch'; sw.style.background = c;
-      sw.addEventListener('click', () => { currentColor = c; renderPalette(); });
+      const sw = document.createElement('button');
+      sw.className = 'swatch';
+      sw.style.background = c;
+      sw.addEventListener('click', () => {
+        currentColor = c;
+        renderPalette();
+      });
       recentColorsEl.appendChild(sw);
     });
   }
 
+  // =========================================================
+  // Tools
+  // =========================================================
+  function setTool(tool){
+    currentTool = tool;
+    Object.entries(toolBtns).forEach(([k,btn]) => btn.classList.toggle('active', k===tool));
+    if(tool !== 'select') clearSelection();
+    redraw();
+  }
+
+  function setEraser(mode){
+    eraserMode = mode;
+    Object.entries(eraserBtns).forEach(([k,btn]) => btn.classList.toggle('active', k===mode));
+    if(mode === 'clear'){
+      if(confirm('キャンバス上の内容をすべて削除しますか？')){
+        saveSnapshot();
+        objects = [];
+        // 全消し時はズーム表示もリセット
+        zoom = 1;
+        panX = 0;
+        panY = 0;
+        clearSelection();
+        redraw();
+      }else{
+        eraserMode = 'pixel';
+        eraserBtns.pixel.classList.add('active');
+        eraserBtns.clear.classList.remove('active');
+      }
+      return;
+    }
+    currentTool = mode === 'pixel' ? 'eraserPixel' : 'eraserObject';
+    Object.values(toolBtns).forEach(btn => btn.classList.remove('active'));
+    clearSelection();
+  }
+
+  function syncUI(){
+    sizeSlider.value = currentSize;
+    sizeValue.textContent = currentSize;
+    renderPalette();
+
+    Object.entries(toolBtns).forEach(([k,btn]) => btn.classList.toggle('active', currentTool===k));
+    Object.entries(eraserBtns).forEach(([k,btn]) => btn.classList.toggle('active', eraserMode===k));
+  }
+
+  // =========================================================
+  // Pointer events (マルチタッチ/ズーム・パン完全対応)
+  // =========================================================
+  canvas.addEventListener('pointerdown', onPointerDown);
+  canvas.addEventListener('pointermove', onPointerMove);
+  canvas.addEventListener('pointerup', onPointerUp);
+  canvas.addEventListener('pointercancel', onPointerUp);
+
+  function onPointerDown(e){
+    activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+    // 2本指以上でタッチされたら即座に描画処理を破棄してピンチズームモードへ移行
+    if(activePointers.size >= 2){
+      if(currentStroke){
+        currentStroke = null;
+        strokeLastPoint = null;
+      }
+      isPointerDown = false;
+      interaction = { type: 'pinch' };
+
+      const pts = Array.from(activePointers.values());
+      pinchStartDist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+      pinchStartZoom = zoom;
+      pinchStartCenter = {
+        x: (pts[0].x + pts[1].x) / 2,
+        y: (pts[0].y + pts[1].y) / 2
+      };
+      pinchStartPan = { x: panX, y: panY };
+
+      canvas.setPointerCapture(e.pointerId);
+      redraw();
+      return;
+    }
+
+    const pt = getCanvasPoint(e);
+    isPointerDown = true;
+
+    if(currentTool === 'select'){
+      if(selection.bbox && pointInRect(pt, selection.bbox)){
+        interaction = {
+          type:'moveSel',
+          startPt: pt
+        };
+        canvas.setPointerCapture(e.pointerId);
+        return;
+      }
+
+      const hit = hitTestObject(pt);
+      if(hit){
+        selectObject(hit);
+        interaction = {
+          type:'moveSel',
+          startPt: pt
+        };
+        canvas.setPointerCapture(e.pointerId);
+        return;
+      }else{
+        clearSelection();
+        redraw();
+        return;
+      }
+    }
+
+    if(currentTool === 'eraserPixel'){
+      saveSnapshot();
+      interaction = { type:'erasePixel' };
+      eraseAtPoint(pt);
+      redraw();
+      canvas.setPointerCapture(e.pointerId);
+      return;
+    }
+
+    if(currentTool === 'eraserObject'){
+      saveSnapshot();
+      interaction = { type:'eraseObject' };
+      eraseObjectAtPoint(pt);
+      redraw();
+      canvas.setPointerCapture(e.pointerId);
+      return;
+    }
+
+    if(currentTool === 'ruler'){
+      interaction = { type:'ruler' };
+      rulerStart = pt;
+      rulerCurrent = pt;
+      isRulerPreview = true;
+      redraw();
+      canvas.setPointerCapture(e.pointerId);
+      return;
+    }
+
+    if(['pencil','brush','marker'].includes(currentTool)){
+      interaction = { type:'draw' };
+      currentStroke = makeStroke(currentTool, currentColor, currentSize);
+      addStrokePoint(currentStroke, pt, true);
+      strokeLastPoint = pt;
+      redraw();
+      canvas.setPointerCapture(e.pointerId);
+    }
+  }
+
+  function onPointerMove(e){
+    if(!activePointers.has(e.pointerId)) return;
+    activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+    // 2本指ピンチ操作中のキャンバス表示変形処理
+    if(interaction?.type === 'pinch' && activePointers.size >= 2){
+      const pts = Array.from(activePointers.values());
+      const distVal = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+      const center = {
+        x: (pts[0].x + pts[1].x) / 2,
+        y: (pts[0].y + pts[1].y) / 2
+      };
+
+      let newZoom = pinchStartZoom * (distVal / (pinchStartDist || 1));
+      newZoom = clamp(newZoom, 0.1, 20); // 最小0.1倍〜最大20倍までズーム制限
+
+      const rect = canvas.getBoundingClientRect();
+      const cX = pinchStartCenter.x - rect.left;
+      const cY = pinchStartCenter.y - rect.top;
+      const curCX = center.x - rect.left;
+      const curCY = center.y - rect.top;
+
+      // タッチ中心点を固定したズーム＆パンマトリクス計算
+      panX = curCX - ((cX - pinchStartPan.x) / pinchStartZoom) * newZoom;
+      panY = curCY - ((cY - pinchStartPan.y) / pinchStartZoom) * newZoom;
+      zoom = newZoom;
+
+      redraw();
+      updateSelectionUI();
+      return;
+    }
+
+    if(interaction?.type === 'pinch') return;
+
+    const pt = getCanvasPoint(e);
+
+    if(interaction?.type === 'draw' && currentStroke){
+      addStrokePoint(currentStroke, pt, false);
+      strokeLastPoint = pt;
+      redraw();
+      return;
+    }
+
+    if(interaction?.type === 'ruler' && rulerStart){
+      rulerCurrent = pt;
+      redraw();
+      return;
+    }
+
+    if(interaction?.type === 'erasePixel'){
+      eraseAtPoint(pt);
+      redraw();
+      return;
+    }
+
+    if(interaction?.type === 'eraseObject'){
+      eraseObjectAtPoint(pt);
+      redraw();
+      return;
+    }
+
+    if(interaction?.type === 'moveSel' && selection.bbox){
+      const dx = pt.x - interaction.startPt.x;
+      const dy = pt.y - interaction.startPt.y;
+      selection.bbox.x += dx;
+      selection.bbox.y += dy;
+      selection.bbox.cx += dx;
+      selection.bbox.cy += dy;
+      interaction.startPt = pt;
+      selection.transform.tx += dx;
+      selection.transform.ty += dy;
+      updateSelectionUI();
+      return;
+    }
+
+    if(interaction?.type === 'scaleSel' && selection.bbox){
+      const bb = interaction.bbox;
+      const handle = interaction.handle;
+      const cx = bb.cx, cy = bb.cy;
+
+      let sx = 1, sy = 1;
+      const dx = pt.x - interaction.startPt.x;
+      const dy = pt.y - interaction.startPt.y;
+
+      const signX = (handle === 'nw' || handle === 'sw') ? -1 : 1;
+      const signY = (handle === 'nw' || handle === 'ne') ? -1 : 1;
+
+      sx = 1 + signX * dx / Math.max(20, bb.w);
+      sy = 1 + signY * dy / Math.max(20, bb.h);
+
+      sx = Math.abs(sx) < 0.05 ? 0.05 * Math.sign(sx || 1) : sx;
+      sy = Math.abs(sy) < 0.05 ? 0.05 * Math.sign(sy || 1) : sy;
+
+      selection.transform.sx = interaction.startTransform.sx * sx;
+      selection.transform.sy = interaction.startTransform.sy * sy;
+
+      const nw = transformPoint({x:bb.x,y:bb.y},{
+        cx,cy,
+        tx:interaction.startTransform.tx,
+        ty:interaction.startTransform.ty,
+        sx:selection.transform.sx,
+        sy:selection.transform.sy,
+        rotation:selection.transform.rotation
+      });
+      const ne = transformPoint({x:bb.x+bb.w,y:bb.y},{
+        cx,cy,
+        tx:interaction.startTransform.tx,
+        ty:interaction.startTransform.ty,
+        sx:selection.transform.sx,
+        sy:selection.transform.sy,
+        rotation:selection.transform.rotation
+      });
+      const sw = transformPoint({x:bb.x,y:bb.y+bb.h},{
+        cx,cy,
+        tx:interaction.startTransform.tx,
+        ty:interaction.startTransform.ty,
+        sx:selection.transform.sx,
+        sy:selection.transform.sy,
+        rotation:selection.transform.rotation
+      });
+      const se = transformPoint({x:bb.x+bb.w,y:bb.y+bb.h},{
+        cx,cy,
+        tx:interaction.startTransform.tx,
+        ty:interaction.startTransform.ty,
+        sx:selection.transform.sx,
+        sy:selection.transform.sy,
+        rotation:selection.transform.rotation
+      });
+      const xs = [nw.x,ne.x,sw.x,se.x];
+      const ys = [nw.y,ne.y,sw.y,se.y];
+      selection.bbox = {
+        x:Math.min(...xs),
+        y:Math.min(...ys),
+        w:Math.max(...xs)-Math.min(...xs),
+        h:Math.max(...ys)-Math.min(...ys),
+        cx:(Math.min(...xs)+Math.max(...xs))/2,
+        cy:(Math.min(...ys)+Math.max(...ys))/2
+      };
+      updateSelectionUI();
+      return;
+    }
+
+    if(interaction?.type === 'rotateSel' && selection.bbox){
+      const bb = interaction.bbox;
+      const angle = Math.atan2(pt.y - bb.cy, pt.x - bb.cx);
+      let delta = angle - interaction.baseAngle;
+      let deg = Math.round(radToDeg(interaction.startTransform.rotation + delta));
+      const snapped = degToRad(deg);
+      selection.transform.rotation = snapped;
+
+      const corners = [
+        {x:bb.x,y:bb.y},
+        {x:bb.x+bb.w,y:bb.y},
+        {x:bb.x+bb.w,y:bb.y+bb.h},
+        {x:bb.x,y:bb.y+bb.h}
+      ].map(p => transformPoint(p,{
+        cx:bb.cx, cy:bb.cy,
+        tx:interaction.startTransform.tx,
+        ty:interaction.startTransform.ty,
+        sx:interaction.startTransform.sx,
+        sy:interaction.startTransform.sy,
+        rotation:selection.transform.rotation
+      }));
+      const xs = corners.map(p=>p.x), ys = corners.map(p=>p.y);
+      selection.bbox = {
+        x:Math.min(...xs), y:Math.min(...ys),
+        w:Math.max(...xs)-Math.min(...xs),
+        h:Math.max(...ys)-Math.min(...ys),
+        cx:(Math.min(...xs)+Math.max(...xs))/2,
+        cy:(Math.min(...ys)+Math.max(...ys))/2
+      };
+      updateSelectionUI();
+      showAngleBadge(bb.cx * zoom + panX, (bb.y * zoom + panY) - 42, `${deg}°`);
+      return;
+    }
+  }
+
+  function onPointerUp(e){
+    activePointers.delete(e.pointerId);
+
+    if(interaction?.type === 'pinch'){
+      if(activePointers.size < 2){
+        interaction = null;
+      }
+      redraw();
+      return;
+    }
+
+    isPointerDown = false;
+
+    if(interaction?.type === 'draw' && currentStroke){
+      if(currentStroke.points.length >= 1){
+        saveSnapshot();
+        finalizeStroke(currentStroke);
+        objects.push(currentStroke);
+      }
+      currentStroke = null;
+      strokeLastPoint = null;
+      redraw();
+    }
+
+    if(interaction?.type === 'ruler' && rulerStart && rulerCurrent){
+      saveSnapshot();
+      const stroke = makeStroke(currentTool === 'marker' ? 'marker' : 'pencil', currentColor, currentSize);
+      stroke.tool = currentTool === 'marker' ? 'marker' : 'pencil';
+      stroke.points = [
+        {x:rulerStart.x, y:rulerStart.y, w:currentSize},
+        {x:rulerCurrent.x, y:rulerCurrent.y, w:currentSize}
+      ];
+      finalizeStroke(stroke);
+      objects.push(stroke);
+      isRulerPreview = false;
+      rulerStart = rulerCurrent = null;
+      selectionUI.angleEl?.classList.add('hidden');
+      redraw();
+    }
+
+    if(interaction?.type === 'moveSel'){
+      if(selection.ids.length){
+        commitSelectionTransform();
+      }
+    }
+
+    if(interaction?.type === 'scaleSel' || interaction?.type === 'rotateSel'){
+      if(selection.ids.length){
+        commitSelectionTransform();
+      }
+      selectionUI.angleEl?.classList.add('hidden');
+    }
+
+    interaction = null;
+  }
+
+  function pointInRect(pt, rect){
+    return pt.x >= rect.x && pt.x <= rect.x + rect.w && pt.y >= rect.y && pt.y <= rect.y + rect.h;
+  }
+
+  // =========================================================
+  // Add stroke point with brush speed variation
+  // =========================================================
+  function addStrokePoint(stroke, pt, isFirst){
+    if(isFirst || !stroke.points.length){
+      stroke.points.push({x:pt.x, y:pt.y, w:stroke.size});
+      return;
+    }
+
+    const prev = stroke.points[stroke.points.length - 1];
+    const dx = pt.x - prev.x;
+    const dy = pt.y - prev.y;
+    const d = Math.hypot(dx, dy);
+    if(d < 0.4) return;
+
+    const steps = Math.max(1, Math.ceil(d / 2.5));
+    for(let i=1;i<=steps;i++){
+      const t = i / steps;
+      const x = lerp(prev.x, pt.x, t);
+      const y = lerp(prev.y, pt.y, t);
+
+      let width = stroke.size;
+
+      if(stroke.tool === 'brush'){
+        const dt = Math.max(1, pt.t - (strokeLastPoint?.t || pt.t - 16));
+        const speed = d / dt; 
+        const normalized = clamp((speed - 0.08) / 1.2, 0, 1);
+        const target = stroke.size * lerp(1.22, 0.72, normalized);
+        const prevW = stroke.points[stroke.points.length - 1]?.w ?? stroke.size;
+        width = lerp(prevW, target, 0.32); 
+      }
+
+      stroke.points.push({x, y, w: clamp(width, 1, 200)});
+    }
+  }
+
+  // =========================================================
+  // Eraser
+  // =========================================================
+  function eraseObjectAtPoint(pt){
+    const hit = hitTestObject(pt);
+    if(hit){
+      objects = objects.filter(o => o.id !== hit.id);
+      if(selection.ids.includes(hit.id)) clearSelection();
+    }
+  }
+
+  function eraseAtPoint(pt){
+    const radius = Math.max(6, currentSize * 0.75);
+
+    const newObjects = [];
+    for(const obj of objects){
+      if(obj.type !== 'stroke'){
+        newObjects.push(obj);
+        continue;
+      }
+
+      const bb = obj.bbox || calcStrokeBBox(obj);
+      if(pt.x < bb.x - radius || pt.x > bb.x + bb.w + radius || pt.y < bb.y - radius || pt.y > bb.y + bb.h + radius){
+        newObjects.push(obj);
+        continue;
+      }
+
+      const segments = [];
+      let currentSeg = [];
+
+      for(const p of obj.points){
+        const hit = Math.hypot(p.x - pt.x, p.y - pt.y) <= radius + (p.w ?? obj.size)/2;
+        if(hit){
+          if(currentSeg.length >= 2){
+            segments.push(currentSeg);
+          }
+          currentSeg = [];
+        }else{
+          currentSeg.push({...p});
+        }
+      }
+      if(currentSeg.length >= 2) segments.push(currentSeg);
+
+      if(!segments.length){
+        continue;
+      }
+
+      if(segments.length === 1 && segments[0].length === obj.points.length){
+        newObjects.push(obj);
+      }else{
+        for(const seg of segments){
+          const cloned = {
+            ...deepClone(obj),
+            id: crypto.randomUUID(),
+            points: seg
+          };
+          cloned.bbox = calcStrokeBBox(cloned);
+          newObjects.push(cloned);
+        }
+      }
+    }
+
+    objects = newObjects;
+    if(selection.ids.length){
+      const alive = new Set(objects.map(o=>o.id));
+      selection.ids = selection.ids.filter(id => alive.has(id));
+      if(selection.ids.length){
+        updateSelectionBBox();
+        updateSelectionUI();
+      }else{
+        clearSelection();
+      }
+    }
+  }
+
+  // =========================================================
+  // Save / load / image
+  // =========================================================
+  function saveToFile(){
+    const json = serializeDoc();
+    localStorage.setItem(STORAGE_KEY_DOC, json);
+    const blob = new Blob([json], {type:'application/json'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'loilo_note_like_data.json';
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function insertImageFile(file){
+    const reader = new FileReader();
+    reader.onload = () => {
+      const src = reader.result;
+      const img = new Image();
+      img.onload = () => {
+        saveSnapshot();
+        const maxW = Math.min(viewW * 0.6, img.width);
+        const scale = maxW / img.width;
+        const w = img.width * scale;
+        const h = img.height * scale;
+        
+        // 現在の見えている表示画面の中心（論理空間）に配置
+        const cx = (viewW / 2 - panX) / zoom;
+        const cy = (viewH / 2 - panY) / zoom;
+
+        const obj = {
+          id: crypto.randomUUID(),
+          type:'image',
+          src,
+          x: cx - w / 2,
+          y: cy - h / 2,
+          w,h,
+          transform:{tx:0,ty:0,sx:1,sy:1,rotation:0}
+        };
+        objects.push(obj);
+        selectObject(obj);
+        redraw();
+      };
+      img.src = src;
+    };
+    reader.readAsDataURL(file);
+  }
+
+  // =========================================================
+  // Events - toolbar
+  // =========================================================
   toolBtns.pencil.addEventListener('click', ()=>setTool('pencil'));
+  toolBtns.brush.addEventListener('click', ()=>setTool('brush'));
   toolBtns.marker.addEventListener('click', ()=>setTool('marker'));
   toolBtns.ruler.addEventListener('click', ()=>setTool('ruler'));
   toolBtns.select.addEventListener('click', ()=>setTool('select'));
+
   eraserBtns.pixel.addEventListener('click', ()=>setEraser('pixel'));
   eraserBtns.object.addEventListener('click', ()=>setEraser('object'));
   eraserBtns.clear.addEventListener('click', ()=>setEraser('clear'));
 
-  sizeSlider.addEventListener('input', () => { currentSize = Number(sizeSlider.value); sizeValue.textContent = currentSize; });
-  paletteToggle.addEventListener('click', (e) => { e.stopPropagation(); palettePop.classList.toggle('open'); });
-  document.addEventListener('click', (e) => { if(!palettePop.contains(e.target) && e.target !== paletteToggle) palettePop.classList.remove('open'); });
+  sizeSlider.addEventListener('input', () => {
+    currentSize = Number(sizeSlider.value);
+    sizeValue.textContent = currentSize;
+  });
 
-  customColorPicker.addEventListener('change', () => { currentColor = customColorPicker.value; pushRecentColor(currentColor); renderPalette(); });
-  addCustomColorBtn.addEventListener('click', () => { currentColor = customColorPicker.value; pushRecentColor(currentColor); renderPalette(); });
+  paletteToggle.addEventListener('click', (e) => {
+    e.stopPropagation();
+    palettePop.classList.toggle('open');
+  });
 
-  undoBtn.addEventListener('click', () => { if(!undoStack.length) return; redoStack.push(serializeDoc()); restoreDoc(undoStack.pop()); });
-  redoBtn.addEventListener('click', () => { if(!redoStack.length) return; undoStack.push(serializeDoc()); restoreDoc(redoStack.pop()); });
-  saveBtn.addEventListener('click', () => { const json = serializeDoc(); localStorage.setItem(STORAGE_KEY_DOC, json); const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([json], {type:'application/json'})); a.download = 'canvas_data.json'; a.click(); });
+  document.addEventListener('click', (e) => {
+    if(!palettePop.contains(e.target) && e.target !== paletteToggle){
+      palettePop.classList.remove('remove'); // クローズを確定
+      palettePop.classList.remove('open');
+    }
+  });
+
+  customColorPicker.addEventListener('input', () => {
+    pendingColorFromDrag = customColorPicker.value;
+    currentColor = pendingColorFromDrag;
+    renderPalette();
+  });
+  customColorPicker.addEventListener('change', () => {
+    const c = customColorPicker.value;
+    currentColor = c;
+    pushRecentColor(c);
+    pendingColorFromDrag = null;
+    renderPalette();
+  });
+
+  addCustomColorBtn.addEventListener('click', () => {
+    currentColor = customColorPicker.value;
+    pushRecentColor(currentColor);
+    renderPalette();
+  });
+
+  undoBtn.addEventListener('click', () => {
+    if(!undoStack.length) return;
+    redoStack.push(serializeDoc());
+    const json = undoStack.pop();
+    restoreDoc(json);
+  });
+
+  redoBtn.addEventListener('click', () => {
+    if(!redoStack.length) return;
+    undoStack.push(serializeDoc());
+    const json = redoStack.pop();
+    restoreDoc(json);
+  });
+
+  saveBtn.addEventListener('click', saveToFile);
+
   loadBtn.addEventListener('click', () => loadInput.click());
-  loadInput.addEventListener('change', async (e) => { const file = e.target.files?.[0]; if(file) { saveSnapshot(); restoreDoc(await file.text()); } loadInput.value = ''; });
+  loadInput.addEventListener('change', async (e) => {
+    const file = e.target.files?.[0];
+    if(!file) return;
+    const text = await file.text();
+    saveSnapshot();
+    restoreDoc(text);
+    loadInput.value = '';
+  });
 
   insertImageBtn.addEventListener('click', () => imageInput.click());
   imageInput.addEventListener('change', (e) => {
-    const file = e.target.files?.[0]; if(!file) return;
-    const r = new FileReader(); r.onload = () => {
-      const img = new Image(); img.onload = () => {
-        saveSnapshot(); const maxW = Math.min(viewW * 0.6, img.width); const s = maxW / img.width; const w = img.width * s; const h = img.height * s;
-        const obj = { id: crypto.randomUUID(), type:'image', src: r.result, x:(viewW-w)/2, y:(viewH-h)/2, w, h, transform:{tx:0,ty:0,sx:1,sy:1,rotation:0} };
-        objects.push(obj); selectObject(obj); redraw();
-      }; img.src = r.result;
-    }; r.readAsDataURL(file);
+    const file = e.target.files?.[0];
+    if(file) insertImageFile(file);
     imageInput.value = '';
   });
 
+  // 表示リセットボタン
+  resetViewBtn.addEventListener('click', () => {
+    zoom = 1;
+    panX = 0;
+    panY = 0;
+    redraw();
+    updateSelectionUI();
+  });
+
+  // マウスホイールでのズームイン・アウト対応
+  canvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const rect = canvas.getBoundingClientRect();
+    const mouseX = e.clientX - rect.left;
+    const mouseY = e.clientY - rect.top;
+    
+    const zoomFactor = e.deltaY < 0 ? 1.05 : 1 / 1.05;
+    let newZoom = zoom * zoomFactor;
+    newZoom = clamp(newZoom, 0.1, 20);
+    
+    panX = mouseX - (mouseX - panX) * (newZoom / zoom);
+    panY = mouseY - (mouseY - panY) * (newZoom / zoom);
+    zoom = newZoom;
+    
+    redraw();
+    updateSelectionUI();
+  }, { passive: false });
+
+  // キーボードショートカット
   window.addEventListener('keydown', (e) => {
     const mod = e.ctrlKey || e.metaKey;
-    if(mod && e.key.toLowerCase() === 'z') { e.preventDefault(); undoBtn.click(); }
-    if(mod && (e.key.toLowerCase() === 'y' || (e.shiftKey && e.key.toLowerCase() === 'z'))) { e.preventDefault(); redoBtn.click(); }
-    if(mod && e.key.toLowerCase() === 'c') { if(selection.ids.length) { e.preventDefault(); copySelection(); } }
-    if(mod && e.key.toLowerCase() === 'v') { e.preventDefault(); pasteClipboard(); }
-    if(e.key === 'Delete' || e.key === 'Backspace') { if(selection.ids.length) { e.preventDefault(); deleteSelection(); } }
+    if(mod && e.key.toLowerCase() === 'z'){
+      e.preventDefault();
+      undoBtn.click();
+      return;
+    }
+    if(mod && (e.key.toLowerCase() === 'y' || (e.shiftKey && e.key.toLowerCase() === 'z'))){
+      e.preventDefault();
+      redoBtn.click();
+      return;
+    }
+    if(mod && e.key.toLowerCase() === 'c'){
+      if(selection.ids.length){
+        e.preventDefault();
+        copySelection();
+      }
+      return;
+    }
+    if(mod && e.key.toLowerCase() === 'v'){
+      e.preventDefault();
+      pasteClipboard();
+      return;
+    }
+    if(e.key === 'Delete' || e.key === 'Backspace'){
+      if(selection.ids.length){
+        e.preventDefault();
+        deleteSelection();
+      }
+    }
   });
 
   window.addEventListener('resize', resizeCanvas);
-  
-  // Initialize
-  ensureSelectionUI(); syncUI(); resizeCanvas();
-  const saved = localStorage.getItem(STORAGE_KEY_DOC);
-  if(saved) { try { restoreDoc(saved); } catch(e){} } else redraw();
+
+  // =========================================================
+  // Init
+  // =========================================================
+  function init(){
+    ensureSelectionUI();
+    syncUI();
+    resizeCanvas();
+
+    const saved = localStorage.getItem(STORAGE_KEY_DOC);
+    if(saved){
+      try{
+        restoreDoc(saved);
+      }catch(e){}
+    }else{
+      redraw();
+    }
+  }
+
+  init();
 })();
 </script>
 </body>
