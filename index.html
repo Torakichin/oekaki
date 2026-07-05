@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1.0,user-scalable=no" />
-<title>LoiLo風 手書きアプリ</title>
+<title>LoiLo風 手書きアプリ (ズーム・パン対応)</title>
 <style>
   :root{
     --toolbar-h: 92px;
@@ -27,8 +27,6 @@
     background: var(--bg);
     color: var(--text);
     overflow:hidden;
-    /* ピンチズーム時のブラウザ既定動作を抑制 */
-    touch-action: none;
   }
 
   #app{
@@ -331,6 +329,7 @@
     <div class="toolbar">
       <div class="tool-group">
         <button class="tool-btn active" id="tool-pencil" title="鉛筆">✏️ 鉛筆</button>
+        <button class="tool-btn" id="tool-brush" title="筆">🖌 筆</button>
         <button class="tool-btn" id="tool-marker" title="マーカー">🖍 マーカー</button>
         <button class="tool-btn" id="tool-ruler" title="ものさし">📏 定規</button>
         <button class="tool-btn" id="tool-select" title="範囲選択">⬚ 選択</button>
@@ -388,6 +387,7 @@
         <button class="tool-btn" id="insertImageBtn">🖼 画像</button>
         <button class="tool-btn" id="saveBtn">💾 保存</button>
         <button class="tool-btn" id="loadBtn">📂 読込</button>
+        <button class="tool-btn" id="resetViewBtn" title="表示リセット">🔍 リセット</button>
       </div>
     </div>
   </div>
@@ -395,7 +395,7 @@
   <div id="canvasWrap">
     <canvas id="drawCanvas"></canvas>
     <div id="selectionOverlay"></div>
-    <div class="hint">ロイロ風の手書きUIです。2本指ピンチで拡大縮小・移動、選択時は枠内移動やハンドル変形が可能です。</div>
+    <div class="hint">2本指ピンチで拡大縮小・移動ができます。細部をきれいに仕上げる際に便利です。</div>
   </div>
 
   <input class="file-input" type="file" id="imageInput" accept="image/*" />
@@ -414,6 +414,7 @@
 
   const toolBtns = {
     pencil: document.getElementById('tool-pencil'),
+    brush: document.getElementById('tool-brush'),
     marker: document.getElementById('tool-marker'),
     ruler: document.getElementById('tool-ruler'),
     select: document.getElementById('tool-select'),
@@ -440,6 +441,7 @@
   const insertImageBtn = document.getElementById('insertImageBtn');
   const saveBtn = document.getElementById('saveBtn');
   const loadBtn = document.getElementById('loadBtn');
+  const resetViewBtn = document.getElementById('resetViewBtn');
   const imageInput = document.getElementById('imageInput');
   const loadInput = document.getElementById('loadInput');
 
@@ -455,8 +457,12 @@
     '#64c7ec','#b388ff','#f7c59f','#90a4ae','#e6c9a8','#b0bec5','#c5cae9','#ef9a9a','#ffcc80','#fff59d','#b9f6ca','#b39ddb'
   ];
 
+  const BRUSH_BASE_ALPHA = 0.9;
   const PENCIL_ALPHA = 1.0;
   const MARKER_ALPHA = 0.35;
+
+  const MIN_BRUSH_SIZE = 1;
+  const MAX_BRUSH_SIZE = 60;
 
   // =========================================================
   // State
@@ -464,18 +470,6 @@
   let dpr = Math.max(1, window.devicePixelRatio || 1);
   let viewW = 0, viewH = 0;
 
-  // ズーム・パン状態
-  let zoom = 1;
-  let panX = 0;
-  let panY = 0;
-
-  // マルチタッチトラッキング用
-  let activePointers = [];
-  let lastPinchDist = 0;
-  let lastPinchCenter = { x: 0, y: 0 };
-  let isPinching = false;
-
-  /** @type {Array<Object>} */
   let objects = []; 
   let undoStack = [];
   let redoStack = [];
@@ -492,6 +486,16 @@
   let isRulerPreview = false;
   let rulerStart = null;
   let rulerCurrent = null;
+
+  // ===== ズーム・パン用ステート =====
+  let zoom = 1;
+  let panX = 0;
+  let panY = 0;
+  let activePointers = new Map();
+  let pinchStartDist = 0;
+  let pinchStartZoom = 1;
+  let pinchStartCenter = { x: 0, y: 0 };
+  let pinchStartPan = { x: 0, y: 0 };
 
   let selection = {
     ids: [],
@@ -548,12 +552,6 @@
       if(data.currentColor) currentColor = data.currentColor;
       if(data.currentSize) currentSize = data.currentSize;
       if(Array.isArray(data.recentColors)) recentColors = data.recentColors.slice(0,18);
-      
-      // 読み込み時は画面表示スケールをリセット
-      zoom = 1;
-      panX = 0;
-      panY = 0;
-
       clearSelection();
       renderPalette();
       syncUI();
@@ -589,14 +587,14 @@
     return c.fillStyle;
   }
 
-  // 表示座標からズーム・パンを逆算した「ワールド座標」を取得
+  // 表示上の座標からズーム・パンを逆算して論理（キャンバス内部）座標へ変換
   function getCanvasPoint(e){
     const rect = canvas.getBoundingClientRect();
-    const screenX = e.clientX - rect.left;
-    const screenY = e.clientY - rect.top;
+    const cx = e.clientX - rect.left;
+    const cy = e.clientY - rect.top;
     return {
-      x: (screenX - panX) / zoom,
-      y: (screenY - panY) / zoom,
+      x: (cx - panX) / zoom,
+      y: (cy - panY) / zoom,
       t: performance.now()
     };
   }
@@ -609,6 +607,7 @@
     canvas.height = Math.round(viewH * dpr);
     canvas.style.width = viewW + 'px';
     canvas.style.height = viewH + 'px';
+    ctx.setTransform(dpr,0,0,dpr,0,0);
     redraw();
     updateSelectionUI();
   }
@@ -618,6 +617,7 @@
   // =========================================================
   function getObjectAlpha(obj){
     if(obj.tool === 'marker') return obj.opacity ?? MARKER_ALPHA;
+    if(obj.tool === 'brush') return obj.opacity ?? BRUSH_BASE_ALPHA;
     return obj.opacity ?? 1;
   }
 
@@ -627,6 +627,21 @@
     ctx.strokeStyle = obj.color;
     ctx.fillStyle = obj.color;
     ctx.globalAlpha = getObjectAlpha(obj);
+
+    if(obj.tool === 'marker'){
+      ctx.lineWidth = obj.size;
+      ctx.shadowBlur = 0;
+      ctx.filter = 'none';
+      return;
+    }
+
+    if(obj.tool === 'brush'){
+      ctx.lineWidth = obj.size;
+      ctx.shadowColor = obj.color;
+      ctx.shadowBlur = Math.max(0, obj.size * 0.22);
+      return;
+    }
+
     ctx.lineWidth = obj.size;
     ctx.shadowBlur = 0;
     ctx.filter = 'none';
@@ -642,7 +657,7 @@
       tool,
       color,
       size,
-      opacity: tool === 'marker' ? MARKER_ALPHA : PENCIL_ALPHA,
+      opacity: tool === 'marker' ? MARKER_ALPHA : (tool === 'brush' ? BRUSH_BASE_ALPHA : PENCIL_ALPHA),
       points: [], 
       bbox: null
     };
@@ -659,7 +674,7 @@
     if(!pts.length) return {x:0,y:0,w:0,h:0,cx:0,cy:0};
     let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;
     for(const p of pts){
-      const w = stroke.size / 2 + 3;
+      const w = (p.w ?? stroke.size) / 2 + 3;
       minX = Math.min(minX, p.x - w);
       minY = Math.min(minY, p.y - w);
       maxX = Math.max(maxX, p.x + w);
@@ -668,31 +683,90 @@
     return { x:minX, y:minY, w:maxX-minX, h:maxY-minY, cx:(minX+maxX)/2, cy:(minY+maxY)/2 };
   }
 
-  // 鉛筆・マーカー共にクアドラティック曲線でなめらかに一括描画
   function drawStrokeObject(obj){
     if(!obj.points?.length) return;
     ctx.save();
     applyStrokeStyle(ctx, obj);
 
-    ctx.beginPath();
+    if(obj.tool === 'marker'){
+      ctx.beginPath();
+      const pts = obj.points;
+      if(pts.length === 1){
+        ctx.arc(pts[0].x, pts[0].y, obj.size/2, 0, Math.PI*2);
+        ctx.fill();
+      }else{
+        ctx.moveTo(pts[0].x, pts[0].y);
+        for(let i=1;i<pts.length;i++){
+          const p0 = pts[i-1];
+          const p1 = pts[i];
+          const mx = (p0.x + p1.x) / 2;
+          const my = (p0.y + p1.y) / 2;
+          ctx.quadraticCurveTo(p0.x, p0.y, mx, my);
+        }
+        const last = pts[pts.length-1];
+        ctx.lineTo(last.x, last.y);
+        ctx.stroke();
+      }
+      ctx.restore();
+      return;
+    }
+
+    if(obj.tool === 'brush'){
+      drawVariableWidthStroke(obj, true);
+      ctx.restore();
+      return;
+    }
+
+    drawVariableWidthStroke(obj, false);
+    ctx.restore();
+  }
+
+  function drawVariableWidthStroke(obj, isBrush){
     const pts = obj.points;
     if(pts.length === 1){
-      ctx.arc(pts[0].x, pts[0].y, obj.size/2, 0, Math.PI*2);
+      const p = pts[0];
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, (p.w ?? obj.size)/2, 0, Math.PI*2);
       ctx.fill();
-    }else{
-      ctx.moveTo(pts[0].x, pts[0].y);
-      for(let i=1; i<pts.length; i++){
-        const p0 = pts[i-1];
-        const p1 = pts[i];
-        const mx = (p0.x + p1.x) / 2;
-        const my = (p0.y + p1.y) / 2;
-        ctx.quadraticCurveTo(p0.x, p0.y, mx, my);
-      }
-      const last = pts[pts.length-1];
-      ctx.lineTo(last.x, last.y);
-      ctx.stroke();
+      return;
     }
-    ctx.restore();
+
+    for(let i=1;i<pts.length;i++){
+      const p0 = pts[i-1];
+      const p1 = pts[i];
+      const w0 = p0.w ?? obj.size;
+      const w1 = p1.w ?? obj.size;
+
+      const angle = Math.atan2(p1.y-p0.y, p1.x-p0.x);
+      const dx0 = Math.sin(angle) * w0/2;
+      const dy0 = -Math.cos(angle) * w0/2;
+      const dx1 = Math.sin(angle) * w1/2;
+      const dy1 = -Math.cos(angle) * w1/2;
+
+      ctx.beginPath();
+      ctx.moveTo(p0.x + dx0, p0.y + dy0);
+      ctx.lineTo(p1.x + dx1, p1.y + dy1);
+      ctx.lineTo(p1.x - dx1, p1.y - dy1);
+      ctx.lineTo(p0.x - dx0, p0.y - dy0);
+      ctx.closePath();
+      ctx.fill();
+
+      if(isBrush){
+        ctx.save();
+        ctx.globalAlpha *= 0.16;
+        ctx.beginPath();
+        ctx.arc(p1.x, p1.y, Math.max(1, w1*0.48), 0, Math.PI*2);
+        ctx.fill();
+        ctx.restore();
+      }
+    }
+
+    const first = pts[0];
+    const last = pts[pts.length-1];
+    ctx.beginPath();
+    ctx.arc(first.x, first.y, (first.w ?? obj.size)/2, 0, Math.PI*2);
+    ctx.arc(last.x, last.y, (last.w ?? obj.size)/2, 0, Math.PI*2);
+    ctx.fill();
   }
 
   function drawImageObject(obj){
@@ -748,10 +822,10 @@
 
     let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;
     for(const p of pts){
-      minX = Math.min(minX,p.x);
-      minY = Math.min(minY,p.y);
-      maxX = Math.max(maxX,p.x);
-      maxY = Math.max(maxY,p.y);
+      minX = Math.min(minX, p.x);
+      minY = Math.min(minY, p.y);
+      maxX = Math.max(maxX, p.x);
+      maxY = Math.max(maxY, p.y);
     }
     return {x:minX,y:minY,w:maxX-minX,h:maxY-minY,cx:(minX+maxX)/2,cy:(minY+maxY)/2};
   }
@@ -787,11 +861,11 @@
     const pts = stroke.points;
     for(let i=1;i<pts.length;i++){
       const p0 = pts[i-1], p1 = pts[i];
-      const w = stroke.size / 2 + 8;
+      const w = Math.max(p0.w ?? stroke.size, p1.w ?? stroke.size) / 2 + 8;
       if(pointToSegmentDistance(pt, p0, p1) <= w) return true;
     }
     if(pts.length === 1){
-      return dist(pt, pts[0]) <= stroke.size/2 + 6;
+      return dist(pt, pts[0]) <= (pts[0].w ?? stroke.size)/2 + 6;
     }
     return false;
   }
@@ -873,7 +947,10 @@
             cx:bbox.cx, cy:bbox.cy,
             tx:t.tx, ty:t.ty, sx:t.sx, sy:t.sy, rotation:t.rotation
           });
-          return { ...p, x:tp.x, y:tp.y };
+          let newW = p.w ?? obj.size;
+          const scaleFactor = (Math.abs(t.sx) + Math.abs(t.sy)) / 2;
+          newW = clamp(newW * scaleFactor, 1, 300);
+          return { ...p, x:tp.x, y:tp.y, w:newW };
         });
         obj.points = pts;
         obj.size = clamp(obj.size * ((Math.abs(t.sx)+Math.abs(t.sy))/2), 1, 300);
@@ -992,7 +1069,6 @@
     panel.querySelector('#deleteSelBtn').addEventListener('click', deleteSelection);
   }
 
-  // 選択枠UIの位置計算を現在の拡大・縮小・パン（スクリーン座標）に合わせる
   function updateSelectionUI(){
     ensureSelectionUI();
 
@@ -1011,29 +1087,27 @@
       return;
     }
 
-    const bb = selection.bbox; 
-    
-    // ワールド座標から現在のスクリーン画面上の座標へ変換
-    const screenX = bb.x * zoom + panX;
-    const screenY = bb.y * zoom + panY;
-    const screenW = bb.w * zoom;
-    const screenH = bb.h * zoom;
-    const screenCx = bb.cx * zoom + panX;
+    // 選択UI枠を現在のズーム・パン状態（画面座標系）に変換して配置
+    const bb = selection.bbox;
+    const sX = bb.x * zoom + panX;
+    const sY = bb.y * zoom + panY;
+    const sW = bb.w * zoom;
+    const sH = bb.h * zoom;
+    const sCX = bb.cx * zoom + panX;
+    const sCY = bb.cy * zoom + panY;
 
     box.classList.remove('hidden');
-    box.style.left = screenX + 'px';
-    box.style.top = screenY + 'px';
-    box.style.width = screenW + 'px';
-    box.style.height = screenH + 'px';
+    box.style.left = sX + 'px';
+    box.style.top = sY + 'px';
+    box.style.width = sW + 'px';
+    box.style.height = sH + 'px';
 
-    // panel
     panel.classList.remove('hidden');
-    const panelTop = Math.max(8, screenY - 88);
-    const panelLeft = clamp(screenX, 8, viewW - panel.offsetWidth - 8);
+    const panelTop = Math.max(8, sY - 88);
+    const panelLeft = clamp(sX, 8, viewW - panel.offsetWidth - 8);
     panel.style.left = panelLeft + 'px';
     panel.style.top = panelTop + 'px';
 
-    // selected size preview
     const selected = getSelectedObjects();
     const avgSize = selected.length
       ? Math.round(selected.reduce((s,o)=>s+(o.size||8),0)/selected.length)
@@ -1043,12 +1117,11 @@
     selSizeSlider.value = clamp(avgSize,1,60);
     selSizeValue.textContent = selSizeSlider.value;
 
-    // handles
     const pts = {
-      nw:{x:screenX,y:screenY},
-      ne:{x:screenX+screenW,y:screenY},
-      sw:{x:screenX,y:screenY+screenH},
-      se:{x:screenX+screenW,y:screenY+screenH}
+      nw:{x:sX,y:sY},
+      ne:{x:sX+sW,y:sY},
+      sw:{x:sX,y:sY+sH},
+      se:{x:sX+sW,y:sY+sH}
     };
     for(const k of ['nw','ne','sw','se']){
       const h = handles[k];
@@ -1057,17 +1130,16 @@
       h.style.top = pts[k].y + 'px';
     }
 
-    // 回転ハンドル
-    const rotateY = screenY - 34;
-    const rotateX = screenCx;
+    const rotateY = sY - 34;
+    const rotateX = sCX;
     handles.rotate.classList.remove('hidden');
     handles.rotate.style.left = rotateX + 'px';
     handles.rotate.style.top = rotateY + 'px';
 
     stick.classList.remove('hidden');
-    stick.style.left = screenCx + 'px';
+    stick.style.left = sCX + 'px';
     stick.style.top = rotateY + 'px';
-    stick.style.height = Math.max(12, screenY - rotateY) + 'px';
+    stick.style.height = Math.max(12, sY - rotateY) + 'px';
 
     angle.classList.add('hidden');
   }
@@ -1075,6 +1147,7 @@
   function onSelectionHandlePointerDown(e){
     e.stopPropagation();
     e.preventDefault();
+    activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
     if(!selection.bbox) return;
     const handle = e.currentTarget.dataset.handle;
     const pt = getCanvasPoint(e);
@@ -1119,7 +1192,12 @@
     saveSnapshot();
     for(const obj of selected){
       if(obj.type === 'stroke'){
+        const factor = size / (obj.size || 1);
         obj.size = size;
+        obj.points = obj.points.map(p => ({
+          ...p,
+          w: clamp((p.w ?? size) * factor, 1, 300)
+        }));
         obj.bbox = calcStrokeBBox(obj);
       }
     }
@@ -1173,9 +1251,7 @@
   function redraw(){
     ctx.clearRect(0,0,viewW,viewH);
     ctx.save();
-    
-    // DPRとズーム・パン(画面全体のスクロール拡縮)をマトリクス適用
-    ctx.scale(dpr, dpr);
+    // キャンバス表示のズーム・パンマトリクスを適用
     ctx.translate(panX, panY);
     ctx.scale(zoom, zoom);
 
@@ -1214,10 +1290,8 @@
     ctx.restore();
 
     const angleDeg = Math.round((radToDeg(Math.atan2(p1.y-p0.y, p1.x-p0.x)) + 360) % 360);
-    // BadgeはHTML要素なのでスクリーン座標に直して表示
-    const screenP1X = p1.x * zoom + panX;
-    const screenP1Y = p1.y * zoom + panY;
-    showAngleBadge(screenP1X, screenP1Y, `${angleDeg}°`);
+    // バッジの表示位置は画面座標系へ変換
+    showAngleBadge(p1.x * zoom + panX, p1.y * zoom + panY, `${angleDeg}°`);
   }
 
   function showAngleBadge(x,y,text){
@@ -1232,25 +1306,6 @@
   // =========================================================
   // Palette
   // =========================================================
-  function renderPalette(){
-    paletteGrid.innerHTML = '';
-    DEFAULT_COLORS.forEach(c => {
-      const sw = document.createElement('button');
-      sw.className = 'swatch';
-      sw.style.background = c;
-      if(normalizeColor(c).toLowerCase() === normalizeColor(currentColor).toLowerCase()){
-        sw.classList.add('active');
-      }
-      sw.addEventListener('click', () => {
-        currentColor = c;
-        pushRecentColor(c);
-        renderPalette();
-      });
-      paletteGrid.appendChild(sw);
-    });
-    renderRecentColors();
-  }
-
   function renderPalette(){
     paletteGrid.innerHTML = '';
     DEFAULT_COLORS.forEach(c => {
@@ -1301,6 +1356,10 @@
       if(confirm('キャンバス上の内容をすべて削除しますか？')){
         saveSnapshot();
         objects = [];
+        // 全消し時はズーム表示もリセット
+        zoom = 1;
+        panX = 0;
+        panY = 0;
         clearSelection();
         redraw();
       }else{
@@ -1325,7 +1384,7 @@
   }
 
   // =========================================================
-  // Pointer events
+  // Pointer events (マルチタッチ/ズーム・パン完全対応)
   // =========================================================
   canvas.addEventListener('pointerdown', onPointerDown);
   canvas.addEventListener('pointermove', onPointerMove);
@@ -1333,31 +1392,34 @@
   canvas.addEventListener('pointercancel', onPointerUp);
 
   function onPointerDown(e){
-    // タッチ点の登録
-    activePointers.push({ id: e.pointerId, x: e.clientX, y: e.clientY });
+    activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
-    // 2本指のタッチを検知した場合は「ピンチイン・アウト(拡縮・画面移動)」を優先
-    if(activePointers.length === 2){
-      isPinching = true;
-      if(interaction){
+    // 2本指以上でタッチされたら即座に描画処理を破棄してピンチズームモードへ移行
+    if(activePointers.size >= 2){
+      if(currentStroke){
         currentStroke = null;
-        interaction = null;
+        strokeLastPoint = null;
       }
       isPointerDown = false;
-      
-      const p1 = activePointers[0];
-      const p2 = activePointers[1];
-      lastPinchDist = Math.hypot(p1.x - p2.x, p1.y - p2.y);
-      lastPinchCenter = { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 };
+      interaction = { type: 'pinch' };
+
+      const pts = Array.from(activePointers.values());
+      pinchStartDist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+      pinchStartZoom = zoom;
+      pinchStartCenter = {
+        x: (pts[0].x + pts[1].x) / 2,
+        y: (pts[0].y + pts[1].y) / 2
+      };
+      pinchStartPan = { x: panX, y: panY };
+
+      canvas.setPointerCapture(e.pointerId);
+      redraw();
       return;
     }
-
-    if(isPinching) return;
 
     const pt = getCanvasPoint(e);
     isPointerDown = true;
 
-    // selection move
     if(currentTool === 'select'){
       if(selection.bbox && pointInRect(pt, selection.bbox)){
         interaction = {
@@ -1412,8 +1474,7 @@
       return;
     }
 
-    // draw tools (Pencil / Marker)
-    if(['pencil','marker'].includes(currentTool)){
+    if(['pencil','brush','marker'].includes(currentTool)){
       interaction = { type:'draw' };
       currentStroke = makeStroke(currentTool, currentColor, currentSize);
       addStrokePoint(currentStroke, pt, true);
@@ -1424,44 +1485,38 @@
   }
 
   function onPointerMove(e){
-    // 移動したタッチ位置の更新
-    const idx = activePointers.findIndex(p => p.id === e.pointerId);
-    if(idx !== -1){
-      activePointers[idx].x = e.clientX;
-      activePointers[idx].y = e.clientY;
-    }
+    if(!activePointers.has(e.pointerId)) return;
+    activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
-    // ピンチズーム＆2本指でのキャンバス全体スクロール処理
-    if(isPinching && activePointers.length === 2){
-      const p1 = activePointers[0];
-      const p2 = activePointers[1];
-      const dist = Math.hypot(p1.x - p2.x, p1.y - p2.y);
-      const center = { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 };
+    // 2本指ピンチ操作中のキャンバス表示変形処理
+    if(interaction?.type === 'pinch' && activePointers.size >= 2){
+      const pts = Array.from(activePointers.values());
+      const distVal = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+      const center = {
+        x: (pts[0].x + pts[1].x) / 2,
+        y: (pts[0].y + pts[1].y) / 2
+      };
+
+      let newZoom = pinchStartZoom * (distVal / (pinchStartDist || 1));
+      newZoom = clamp(newZoom, 0.1, 20); // 最小0.1倍〜最大20倍までズーム制限
 
       const rect = canvas.getBoundingClientRect();
-      const centerCanvas = { x: center.x - rect.left, y: center.y - rect.top };
+      const cX = pinchStartCenter.x - rect.left;
+      const cY = pinchStartCenter.y - rect.top;
+      const curCX = center.x - rect.left;
+      const curCY = center.y - rect.top;
 
-      const zoomFactor = dist / (lastPinchDist || 1);
-      const newZoom = clamp(zoom * zoomFactor, 0.15, 10); // 最小0.15倍〜最大10倍制限
-
-      // 2本指の中心を基準に拡大縮小のズレをパンに補正
-      panX = centerCanvas.x - (centerCanvas.x - panX) * (newZoom / zoom);
-      panY = centerCanvas.y - (centerCanvas.y - panY) * (newZoom / zoom);
+      // タッチ中心点を固定したズーム＆パンマトリクス計算
+      panX = curCX - ((cX - pinchStartPan.x) / pinchStartZoom) * newZoom;
+      panY = curCY - ((cY - pinchStartPan.y) / pinchStartZoom) * newZoom;
       zoom = newZoom;
-
-      // 同時に2本指での画面スクロール(パン移動)も加算
-      panX += (center.x - lastPinchCenter.x);
-      panY += (center.y - lastPinchCenter.y);
-
-      lastPinchDist = dist;
-      lastPinchCenter = center;
 
       redraw();
       updateSelectionUI();
       return;
     }
 
-    if(isPinching) return;
+    if(interaction?.type === 'pinch') return;
 
     const pt = getCanvasPoint(e);
 
@@ -1526,27 +1581,46 @@
       selection.transform.sy = interaction.startTransform.sy * sy;
 
       const nw = transformPoint({x:bb.x,y:bb.y},{
-        cx,cy, tx:interaction.startTransform.tx, ty:interaction.startTransform.ty,
-        sx:selection.transform.sx, sy:selection.transform.sy, rotation:selection.transform.rotation
+        cx,cy,
+        tx:interaction.startTransform.tx,
+        ty:interaction.startTransform.ty,
+        sx:selection.transform.sx,
+        sy:selection.transform.sy,
+        rotation:selection.transform.rotation
       });
       const ne = transformPoint({x:bb.x+bb.w,y:bb.y},{
-        cx,cy, tx:interaction.startTransform.tx, ty:interaction.startTransform.ty,
-        sx:selection.transform.sx, sy:selection.transform.sy, rotation:selection.transform.rotation
+        cx,cy,
+        tx:interaction.startTransform.tx,
+        ty:interaction.startTransform.ty,
+        sx:selection.transform.sx,
+        sy:selection.transform.sy,
+        rotation:selection.transform.rotation
       });
       const sw = transformPoint({x:bb.x,y:bb.y+bb.h},{
-        cx,cy, tx:interaction.startTransform.tx, ty:interaction.startTransform.ty,
-        sx:selection.transform.sx, sy:selection.transform.sy, rotation:selection.transform.rotation
+        cx,cy,
+        tx:interaction.startTransform.tx,
+        ty:interaction.startTransform.ty,
+        sx:selection.transform.sx,
+        sy:selection.transform.sy,
+        rotation:selection.transform.rotation
       });
       const se = transformPoint({x:bb.x+bb.w,y:bb.y+bb.h},{
-        cx,cy, tx:interaction.startTransform.tx, ty:interaction.startTransform.ty,
-        sx:selection.transform.sx, sy:selection.transform.sy, rotation:selection.transform.rotation
+        cx,cy,
+        tx:interaction.startTransform.tx,
+        ty:interaction.startTransform.ty,
+        sx:selection.transform.sx,
+        sy:selection.transform.sy,
+        rotation:selection.transform.rotation
       });
       const xs = [nw.x,ne.x,sw.x,se.x];
       const ys = [nw.y,ne.y,sw.y,se.y];
       selection.bbox = {
-        x:Math.min(...xs), y:Math.min(...ys),
-        w:Math.max(...xs)-Math.min(...xs), h:Math.max(...ys)-Math.min(...ys),
-        cx:(Math.min(...xs)+Math.max(...xs))/2, cy:(Math.min(...ys)+Math.max(...ys))/2
+        x:Math.min(...xs),
+        y:Math.min(...ys),
+        w:Math.max(...xs)-Math.min(...xs),
+        h:Math.max(...ys)-Math.min(...ys),
+        cx:(Math.min(...xs)+Math.max(...xs))/2,
+        cy:(Math.min(...ys)+Math.max(...ys))/2
       };
       updateSelectionUI();
       return;
@@ -1556,40 +1630,46 @@
       const bb = interaction.bbox;
       const angle = Math.atan2(pt.y - bb.cy, pt.x - bb.cx);
       let delta = angle - interaction.baseAngle;
-      let deg = Math.round(radToDeg(interaction.startTransform.rotation + delta)); 
+      let deg = Math.round(radToDeg(interaction.startTransform.rotation + delta));
       const snapped = degToRad(deg);
       selection.transform.rotation = snapped;
 
       const corners = [
-        {x:bb.x,y:bb.y}, {x:bb.x+bb.w,y:bb.y}, {x:bb.x+bb.w,y:bb.y+bb.h}, {x:bb.x,y:bb.y+bb.h}
+        {x:bb.x,y:bb.y},
+        {x:bb.x+bb.w,y:bb.y},
+        {x:bb.x+bb.w,y:bb.y+bb.h},
+        {x:bb.x,y:bb.y+bb.h}
       ].map(p => transformPoint(p,{
-        cx:bb.cx, cy:bb.cy, tx:interaction.startTransform.tx, ty:interaction.startTransform.ty,
-        sx:interaction.startTransform.sx, sy:interaction.startTransform.sy, rotation:selection.transform.rotation
+        cx:bb.cx, cy:bb.cy,
+        tx:interaction.startTransform.tx,
+        ty:interaction.startTransform.ty,
+        sx:interaction.startTransform.sx,
+        sy:interaction.startTransform.sy,
+        rotation:selection.transform.rotation
       }));
       const xs = corners.map(p=>p.x), ys = corners.map(p=>p.y);
       selection.bbox = {
         x:Math.min(...xs), y:Math.min(...ys),
-        w:Math.max(...xs)-Math.min(...xs), h:Math.max(...ys)-Math.min(...ys),
-        cx:(Math.min(...xs)+Math.max(...xs))/2, cy:(Math.min(...ys)+Math.max(...ys))/2
+        w:Math.max(...xs)-Math.min(...xs),
+        h:Math.max(...ys)-Math.min(...ys),
+        cx:(Math.min(...xs)+Math.max(...xs))/2,
+        cy:(Math.min(...ys)+Math.max(...ys))/2
       };
       updateSelectionUI();
-
-      // Badge表示用スクリーン座標
-      const screenY = bb.y * zoom + panY;
-      const screenCx = bb.cx * zoom + panX;
-      showAngleBadge(screenCx, screenY - 42, `${deg}°`);
+      showAngleBadge(bb.cx * zoom + panX, (bb.y * zoom + panY) - 42, `${deg}°`);
       return;
     }
   }
 
   function onPointerUp(e){
-    activePointers = activePointers.filter(p => p.id !== e.pointerId);
-    if(activePointers.length < 2){
-      if(isPinching){
-        isPinching = false;
-        lastPinchDist = 0;
-        return; 
+    activePointers.delete(e.pointerId);
+
+    if(interaction?.type === 'pinch'){
+      if(activePointers.size < 2){
+        interaction = null;
       }
+      redraw();
+      return;
     }
 
     isPointerDown = false;
@@ -1608,6 +1688,7 @@
     if(interaction?.type === 'ruler' && rulerStart && rulerCurrent){
       saveSnapshot();
       const stroke = makeStroke(currentTool === 'marker' ? 'marker' : 'pencil', currentColor, currentSize);
+      stroke.tool = currentTool === 'marker' ? 'marker' : 'pencil';
       stroke.points = [
         {x:rulerStart.x, y:rulerStart.y, w:currentSize},
         {x:rulerCurrent.x, y:rulerCurrent.y, w:currentSize}
@@ -1620,7 +1701,13 @@
       redraw();
     }
 
-    if(interaction?.type === 'moveSel' || interaction?.type === 'scaleSel' || interaction?.type === 'rotateSel'){
+    if(interaction?.type === 'moveSel'){
+      if(selection.ids.length){
+        commitSelectionTransform();
+      }
+    }
+
+    if(interaction?.type === 'scaleSel' || interaction?.type === 'rotateSel'){
       if(selection.ids.length){
         commitSelectionTransform();
       }
@@ -1635,7 +1722,7 @@
   }
 
   // =========================================================
-  // Add stroke point (滑らかな線を描画するための補間処理)
+  // Add stroke point with brush speed variation
   // =========================================================
   function addStrokePoint(stroke, pt, isFirst){
     if(isFirst || !stroke.points.length){
@@ -1649,13 +1736,24 @@
     const d = Math.hypot(dx, dy);
     if(d < 0.4) return;
 
-    // マーカーのようにドットを細かく補間して、隙間のない線を作る
-    const steps = Math.max(1, Math.ceil(d / 2.0));
-    for(let i=1; i<=steps; i++){
+    const steps = Math.max(1, Math.ceil(d / 2.5));
+    for(let i=1;i<=steps;i++){
       const t = i / steps;
       const x = lerp(prev.x, pt.x, t);
       const y = lerp(prev.y, pt.y, t);
-      stroke.points.push({x, y, w: stroke.size});
+
+      let width = stroke.size;
+
+      if(stroke.tool === 'brush'){
+        const dt = Math.max(1, pt.t - (strokeLastPoint?.t || pt.t - 16));
+        const speed = d / dt; 
+        const normalized = clamp((speed - 0.08) / 1.2, 0, 1);
+        const target = stroke.size * lerp(1.22, 0.72, normalized);
+        const prevW = stroke.points[stroke.points.length - 1]?.w ?? stroke.size;
+        width = lerp(prevW, target, 0.32); 
+      }
+
+      stroke.points.push({x, y, w: clamp(width, 1, 200)});
     }
   }
 
@@ -1672,6 +1770,7 @@
 
   function eraseAtPoint(pt){
     const radius = Math.max(6, currentSize * 0.75);
+
     const newObjects = [];
     for(const obj of objects){
       if(obj.type !== 'stroke'){
@@ -1689,7 +1788,7 @@
       let currentSeg = [];
 
       for(const p of obj.points){
-        const hit = Math.hypot(p.x - pt.x, p.y - pt.y) <= radius + (obj.size)/2;
+        const hit = Math.hypot(p.x - pt.x, p.y - pt.y) <= radius + (p.w ?? obj.size)/2;
         if(hit){
           if(currentSeg.length >= 2){
             segments.push(currentSeg);
@@ -1759,12 +1858,17 @@
         const scale = maxW / img.width;
         const w = img.width * scale;
         const h = img.height * scale;
+        
+        // 現在の見えている表示画面の中心（論理空間）に配置
+        const cx = (viewW / 2 - panX) / zoom;
+        const cy = (viewH / 2 - panY) / zoom;
+
         const obj = {
           id: crypto.randomUUID(),
           type:'image',
           src,
-          x:(viewW - w)/2,
-          y:(viewH - h)/2,
+          x: cx - w / 2,
+          y: cy - h / 2,
           w,h,
           transform:{tx:0,ty:0,sx:1,sy:1,rotation:0}
         };
@@ -1781,6 +1885,7 @@
   // Events - toolbar
   // =========================================================
   toolBtns.pencil.addEventListener('click', ()=>setTool('pencil'));
+  toolBtns.brush.addEventListener('click', ()=>setTool('brush'));
   toolBtns.marker.addEventListener('click', ()=>setTool('marker'));
   toolBtns.ruler.addEventListener('click', ()=>setTool('ruler'));
   toolBtns.select.addEventListener('click', ()=>setTool('select'));
@@ -1801,6 +1906,7 @@
 
   document.addEventListener('click', (e) => {
     if(!palettePop.contains(e.target) && e.target !== paletteToggle){
+      palettePop.classList.remove('remove'); // クローズを確定
       palettePop.classList.remove('open');
     }
   });
@@ -1857,6 +1963,35 @@
     imageInput.value = '';
   });
 
+  // 表示リセットボタン
+  resetViewBtn.addEventListener('click', () => {
+    zoom = 1;
+    panX = 0;
+    panY = 0;
+    redraw();
+    updateSelectionUI();
+  });
+
+  // マウスホイールでのズームイン・アウト対応
+  canvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const rect = canvas.getBoundingClientRect();
+    const mouseX = e.clientX - rect.left;
+    const mouseY = e.clientY - rect.top;
+    
+    const zoomFactor = e.deltaY < 0 ? 1.05 : 1 / 1.05;
+    let newZoom = zoom * zoomFactor;
+    newZoom = clamp(newZoom, 0.1, 20);
+    
+    panX = mouseX - (mouseX - panX) * (newZoom / zoom);
+    panY = mouseY - (mouseY - panY) * (newZoom / zoom);
+    zoom = newZoom;
+    
+    redraw();
+    updateSelectionUI();
+  }, { passive: false });
+
+  // キーボードショートカット
   window.addEventListener('keydown', (e) => {
     const mod = e.ctrlKey || e.metaKey;
     if(mod && e.key.toLowerCase() === 'z'){
